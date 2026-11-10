@@ -9,11 +9,10 @@ const isProd = process.env.NODE_ENV === 'production';
 // Render injects the service's public URL; use it when PUBLIC_SITE_URL / CORS_ORIGINS aren't set.
 const hostUrl = process.env.RENDER_EXTERNAL_URL || '';
 
-const jwtSecret = process.env.JWT_SECRET || (isProd ? null : 'dev-only-insecure-jwt-secret-change-me');
-if (!jwtSecret) {
-  console.error('FATAL: JWT_SECRET must be set in production.');
-  process.exit(1);
-}
+// In production, missing secrets are generated once and stored in the database
+// (see ensureSecrets in db/index.js). Environment variables always take priority.
+const devSecret = isProd ? '' : 'dev-only-insecure-jwt-secret-change-me';
+const jwtSecret = process.env.JWT_SECRET || devSecret;
 
 export const config = {
   isProd,
@@ -23,7 +22,7 @@ export const config = {
   pgliteDir: path.resolve(SERVER_ROOT, process.env.PGLITE_DIR || 'data/pglite'),
   jwtSecret,
   // Used to encrypt secrets (e.g. WhatsApp token) stored in the database.
-  encryptionKey: process.env.ENCRYPTION_KEY || jwtSecret,
+  encryptionKey: process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || devSecret,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
   publicSiteUrl: (process.env.PUBLIC_SITE_URL || hostUrl || 'http://localhost:5173').replace(/\/$/, ''),
   corsOrigins: (process.env.CORS_ORIGINS || hostUrl || 'http://localhost:5173')

@@ -15,7 +15,7 @@
 | API security | Helmet headers, a JSON body size limit (200 KB), a generic rate limit (600 requests per 15 min), error messages hidden in production, `x-powered-by` disabled. |
 | Rate limiting | Global API limit, plus stricter limits on login, password reset and enquiry submission (5 per 10 min). The enquiry form also has a honeypot field. |
 | Secure image uploads | MIME allow-list **plus magic-byte check** (JPG/PNG/WEBP/GIF), 5 MB limit, at most 10 files per request, random file names, path-traversal-safe deletion, optional Cloudinary storage. |
-| Credentials | All secrets come from environment variables. WhatsApp tokens saved from the admin panel are encrypted with **AES-256-GCM** and never returned to the browser (only a masked hint). |
+| Credentials | All secrets come from environment variables. If `JWT_SECRET` / `ENCRYPTION_KEY` are not set in production, the server generates strong random values once and stores them in the database (`app_secrets` table), never in code. WhatsApp tokens saved from the admin panel are encrypted with **AES-256-GCM** and never returned to the browser (only a masked hint). |
 | Database backups | `npm run backup` (pg_dump, keeps 30 copies). Managed-Postgres backups are recommended. See DEPLOYMENT.md. |
 | Customer data protection | Customer data is reachable only through authenticated admin routes. Enquiry consent is recorded. Public product APIs leave out internal fields such as view counts and thresholds. |
 

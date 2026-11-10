@@ -9,6 +9,7 @@
  * placeholders. All queries in this codebase are parameterised (no string
  * concatenation of user input) which protects against SQL injection.
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -84,8 +85,34 @@ export async function initDb() {
   driver = config.databaseUrl ? await createPg() : await createPglite();
   const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
   await driver.exec(schema);
+  await ensureSecrets();
   console.log(`[db] connected (${driver.kind === 'postgres' ? 'PostgreSQL' : `embedded PGlite at ${config.pgliteDir}`})`);
   return driver;
+}
+
+/**
+ * Fill in JWT_SECRET / ENCRYPTION_KEY when they aren't set in the environment:
+ * generate them once, store them in app_secrets and reuse them on every start,
+ * so sessions and encrypted settings survive restarts.
+ */
+async function ensureSecrets() {
+  const wanted = [
+    ['jwt_secret', 'jwtSecret'],
+    ['encryption_key', 'encryptionKey'],
+  ].filter(([, prop]) => !config[prop]);
+  for (const [name, prop] of wanted) {
+    await driver.query('INSERT INTO app_secrets (name, value) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING', [
+      name,
+      crypto.randomBytes(48).toString('hex'),
+    ]);
+    const { rows } = await driver.query('SELECT value FROM app_secrets WHERE name = $1', [name]);
+    config[prop] = rows[0].value;
+    console.log(`[db] ${name} not set in environment - using the value stored in the database`);
+  }
+  if (config.isProd && driver.kind === 'pglite') {
+    console.warn('[db] WARNING: DATABASE_URL is not set - using an embedded database inside the container.');
+    console.warn('[db]          On hosts like Render this is wiped on every deploy. Attach PostgreSQL for real data.');
+  }
 }
 
 /** Run a parameterised query. Returns the array of rows. */
