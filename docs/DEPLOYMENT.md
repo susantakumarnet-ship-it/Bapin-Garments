@@ -15,7 +15,21 @@ The app deploys as **one Node.js service**: Express serves the REST API and the 
 - [ ] Default passwords changed after first login
 - [ ] Daily database backups scheduled
 
-## Option A: Render / Railway / similar (recommended)
+## Option A1: Render Blueprint (one click)
+
+The repo includes [`render.yaml`](../render.yaml), which creates the web service and a PostgreSQL database together.
+
+1. In the Render dashboard, open your project and choose **New → Blueprint**, then connect the GitHub repo.
+2. Render asks for the values marked `sync: false`. Fill in at least **SEED_ADMIN_EMAIL** and **SEED_ADMIN_PASSWORD**. Leave the rest blank for now if you like. `JWT_SECRET` and `ENCRYPTION_KEY` are generated automatically, and `DATABASE_URL` is wired to the new database.
+3. Click **Apply**. The first deploy builds the site (about 3–5 minutes), creates the tables, the admin account and the sample catalogue.
+4. Open `https://<service>.onrender.com`. The admin panel is at `/admin`.
+
+Notes:
+- `PUBLIC_SITE_URL` and `CORS_ORIGINS` default to the Render URL. Set them explicitly once you add a custom domain.
+- The free plans are fine for trying it out. The free web service sleeps after 15 minutes idle (first visit then takes about a minute), and the free database expires after 30 days. Upgrade both before going live.
+- Render's disk is wiped on every deploy, so set **CLOUDINARY_URL** to keep uploaded product photos.
+
+## Option A2: Render / Railway / similar (manual)
 
 1. Push the project to a GitHub repository.
 2. Create a **PostgreSQL** database (Render Postgres, Railway Postgres, Neon, Supabase or AWS RDS) and copy its connection string.

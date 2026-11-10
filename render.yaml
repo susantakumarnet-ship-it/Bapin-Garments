@@ -1,0 +1,50 @@
+# Render Blueprint: one web service (API + built React site) and a PostgreSQL database.
+# Dashboard -> New -> Blueprint -> pick this repo. See docs/DEPLOYMENT.md.
+databases:
+  - name: bapin-db
+    plan: free            # free databases expire after 30 days; use basic-256mb or higher for the live shop
+    region: singapore
+    databaseName: bapin
+    user: bapin
+
+services:
+  - type: web
+    name: bapin-garments
+    runtime: node
+    plan: free            # free instances sleep after 15 min idle; use starter or higher for the live shop
+    region: singapore
+    buildCommand: npm ci --prefix client --include=dev && npm run build --prefix client && npm ci --prefix server --omit=dev
+    startCommand: node server/src/index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bapin-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      # First admin account, created on first boot (8+ characters, letters and numbers).
+      - key: SEED_ADMIN_EMAIL
+        sync: false
+      - key: SEED_ADMIN_PASSWORD
+        sync: false
+      # Optional. Render's disk is wiped on every deploy, so set this to keep uploaded product photos.
+      - key: CLOUDINARY_URL
+        sync: false
+      # Optional: WhatsApp alerts and password-reset emails (can also be set later).
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false

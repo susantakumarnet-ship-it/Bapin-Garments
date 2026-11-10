@@ -6,6 +6,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const SERVER_ROOT = path.resolve(__dirname, '..');
 
 const isProd = process.env.NODE_ENV === 'production';
+// Render injects the service's public URL; use it when PUBLIC_SITE_URL / CORS_ORIGINS aren't set.
+const hostUrl = process.env.RENDER_EXTERNAL_URL || '';
 
 const jwtSecret = process.env.JWT_SECRET || (isProd ? null : 'dev-only-insecure-jwt-secret-change-me');
 if (!jwtSecret) {
@@ -23,8 +25,8 @@ export const config = {
   // Used to encrypt secrets (e.g. WhatsApp token) stored in the database.
   encryptionKey: process.env.ENCRYPTION_KEY || jwtSecret,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
-  publicSiteUrl: (process.env.PUBLIC_SITE_URL || 'http://localhost:5173').replace(/\/$/, ''),
-  corsOrigins: (process.env.CORS_ORIGINS || 'http://localhost:5173')
+  publicSiteUrl: (process.env.PUBLIC_SITE_URL || hostUrl || 'http://localhost:5173').replace(/\/$/, ''),
+  corsOrigins: (process.env.CORS_ORIGINS || hostUrl || 'http://localhost:5173')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
