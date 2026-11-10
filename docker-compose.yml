@@ -1,0 +1,39 @@
+# Production-like stack: PostgreSQL + Bapin Garments app.
+#   1. cp server/.env.example .env  and set JWT_SECRET, ENCRYPTION_KEY, etc.
+#   2. docker compose up -d --build
+#   3. open http://localhost:4000
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bapin
+      POSTGRES_USER: bapin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U bapin']
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://bapin:${POSTGRES_PASSWORD:-change-this-password}@db:5432/bapin
+      PUBLIC_SITE_URL: ${PUBLIC_SITE_URL:-http://localhost:4000}
+      CORS_ORIGINS: ${PUBLIC_SITE_URL:-http://localhost:4000}
+    ports:
+      - '4000:4000'
+    volumes:
+      - uploads:/app/server/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  uploads:

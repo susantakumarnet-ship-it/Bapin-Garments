@@ -1,0 +1,18 @@
+{
+  "name": "bapin-garments",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bapin Garments - clothing store website with admin dashboard & inventory management",
+  "scripts": {
+    "install:all": "npm install && npm --prefix server install && npm --prefix client install",
+    "dev": "concurrently -n api,web -c yellow,cyan \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start",
+    "seed": "npm --prefix server run seed",
+    "seed:reset": "npm --prefix server run seed -- --reset",
+    "backup": "npm --prefix server run backup"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.7"
+  }
+}
