@@ -6,7 +6,7 @@
 |---|---|---|
 | Node.js | 20 LTS or newer | https://nodejs.org |
 | Git | any | optional |
-| PostgreSQL | 14+ | **Optional in development.** If `DATABASE_URL` is empty, an embedded PostgreSQL (PGlite) is used automatically. |
+| MongoDB | 6+ | A free **MongoDB Atlas** cluster (https://cloud.mongodb.com) or a local MongoDB server. |
 
 ## 2. Install dependencies
 
@@ -30,8 +30,9 @@ The defaults work for local development. Useful settings:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | Leave empty to use embedded Postgres in `server/data/pglite`. Set it to use a real PostgreSQL server, e.g. `postgres://user:pass@localhost:5432/bapin` |
-| `JWT_SECRET`, `ENCRYPTION_KEY` | Long random strings. **Required in production.** Generate one with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
+| `MONGODB_URI` | **Required.** MongoDB connection string. Atlas: *Connect → Drivers*, e.g. `mongodb+srv://USER:PASSWORD@cluster0.xxxxx.mongodb.net/`. Local: `mongodb://127.0.0.1:27017`. Special characters in the password must be URL-encoded (`@` → `%40`); the server also does this automatically. |
+| `MONGODB_DB` | Database name (default `BapinGarments`) |
+| `JWT_SECRET`, `ENCRYPTION_KEY` | Long random strings. If they're missing in production, the server generates them once and stores them in the database. To set your own, generate one with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
 | `SEED_ADMIN_*` | The first admin account, created on first start |
 | `CLOUDINARY_URL` | Optional; stores images on Cloudinary instead of local disk |
 | `SMTP_*` | Optional; sends password-reset emails. Without it, the reset link is printed in the server console. |
@@ -47,21 +48,16 @@ npm run dev
 - Admin: http://localhost:5173/admin (`admin` / `Admin@123`)
 - API health check: http://localhost:4000/api/health
 
-On first start the database tables are created from `server/src/db/schema.sql` and sample data is loaded.
+On first start the indexes are created and, if the database has no admin users, the sample data is loaded.
 
-## 5. Using a local PostgreSQL instead
+## 5. Setting up MongoDB Atlas
 
-```sql
-CREATE DATABASE bapin;
-CREATE USER bapin WITH PASSWORD 'strong-password';
-GRANT ALL PRIVILEGES ON DATABASE bapin TO bapin;
--- PostgreSQL 15+: also run inside the bapin database
-GRANT ALL ON SCHEMA public TO bapin;
-```
+1. Create a free cluster at https://cloud.mongodb.com.
+2. **Database Access:** add a database user with a password.
+3. **Network Access:** add your IP address. For hosting on Render, add `0.0.0.0/0` (allow from anywhere), because Render's outbound IPs change.
+4. **Connect → Drivers:** copy the connection string into `MONGODB_URI` and replace `<password>`.
 
-Set `DATABASE_URL=postgres://bapin:strong-password@localhost:5432/bapin` in `server/.env` and restart. The tables and sample data are created automatically.
-
-You can also apply the schema by hand: `psql "$DATABASE_URL" -f server/src/db/schema.sql`
+The collections, indexes and sample data are created automatically on first start.
 
 ## 6. Useful commands
 
@@ -73,9 +69,10 @@ You can also apply the schema by hand: `psql "$DATABASE_URL" -f server/src/db/sc
 | `npm run seed` | Load sample data (only if the database is empty) |
 | `npm run seed:reset` | **Erase all data** and reload the samples |
 | `npm run backup` | Back up the database to `server/backups/` |
+| `npm run restore -- <file> --yes` | **Replace all data** with a backup file |
 
 ## Troubleshooting
 
 - **Port already in use:** change `PORT` in `server/.env` (and `VITE_API_PROXY` if you run the client separately).
-- **Embedded database errors after a crash:** stop the server, delete `server/data/pglite`, then start again. The samples are re-seeded. Development only!
+- **`Could not connect to MongoDB`:** check the username and password in `MONGODB_URI`, and that Atlas *Network Access* allows your IP address.
 - **Images not showing in admin uploads:** check that `server/uploads` is writable.

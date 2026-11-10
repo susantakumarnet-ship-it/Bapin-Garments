@@ -54,27 +54,3 @@ export function pageParams(q, defLimit = 20, maxLimit = 100) {
 export function digitsOnly(v) {
   return String(v || '').replace(/\D/g, '');
 }
-
-/** Very small helper to build dynamic WHERE clauses with positional params. */
-export class Where {
-  constructor() {
-    this.parts = [];
-    this.params = [];
-  }
-  add(sqlWithQ, ...values) {
-    // sqlWithQ uses `?` for each value; converted to $n.
-    let sql = sqlWithQ;
-    for (const v of values) {
-      this.params.push(v);
-      sql = sql.replace('?', `$${this.params.length}`);
-    }
-    this.parts.push(sql);
-    return this;
-  }
-  get sql() {
-    return this.parts.length ? `WHERE ${this.parts.join(' AND ')}` : '';
-  }
-  next() {
-    return `$${this.params.length + 1}`;
-  }
-}

@@ -48,14 +48,10 @@ export function errorHandler(err, _req, res, _next) {
     const msg = err.code === 'LIMIT_FILE_SIZE' ? `Each image must be under ${config.maxUploadMb} MB` : err.message;
     return res.status(400).json({ error: msg });
   }
-  // Unique-constraint violation from PostgreSQL.
-  if (err?.code === '23505') {
-    const detail = String(err.detail || err.message || '');
-    const field = detail.match(/\((\w+)\)/)?.[1];
+  // Unique-index violation from MongoDB.
+  if (err?.code === 11000) {
+    const field = Object.keys(err.keyPattern || err.keyValue || {}).find((k) => k !== 'product_id') || '';
     return res.status(409).json({ error: field ? `A record with this ${field} already exists` : 'Duplicate value' });
-  }
-  if (err?.code === '23503') {
-    return res.status(409).json({ error: 'This record is linked to other data and cannot be changed/removed' });
   }
   const status = err.status || 500;
   if (status >= 500) console.error(err);

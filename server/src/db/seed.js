@@ -3,12 +3,15 @@
  * products with size/colour-wise inventory, stock history and enquiries.
  *
  *   npm run seed           -> seed only if the database is empty
- *   npm run seed -- --reset -> DROP all data and re-seed (destructive!)
+ *   npm run seed -- --reset -> DELETE all data and re-seed (destructive!)
+ *
+ * Documents are built in memory and written with bulk inserts, so seeding a
+ * remote MongoDB Atlas cluster takes seconds rather than thousands of round trips.
  */
 import bcrypt from 'bcryptjs';
 import { pathToFileURL } from 'node:url';
 import { config } from '../config.js';
-import { initDb, query, one, transaction, closeDb } from './index.js';
+import { initDb, col, closeDb, COLLECTIONS } from './index.js';
 import { CATEGORIES, PRODUCTS, ENQUIRIES, FLAG_MAP } from './seedData.js';
 import { slugify } from '../utils/helpers.js';
 
@@ -23,166 +26,215 @@ function rng(seed) {
 
 const daysAgo = (d, hourOffset = 0) => new Date(Date.now() - d * 86400000 - hourOffset * 3600000);
 
-const TABLES = [
-  'whatsapp_notification_logs', 'customer_enquiries', 'customers', 'stock_transactions', 'inventory',
-  'product_variants', 'product_images', 'products', 'product_categories', 'website_settings', 'admin_users',
-];
-
 export async function resetDatabase() {
-  await query(`TRUNCATE ${TABLES.join(', ')} RESTART IDENTITY CASCADE`);
+  await Promise.all([...COLLECTIONS, 'counters'].map((name) => col(name).deleteMany({})));
+}
+
+/** Collects documents per collection, assigning sequential numeric ids. */
+class Batch {
+  constructor() {
+    this.docs = {};
+  }
+  add(name, doc) {
+    const list = (this.docs[name] ||= []);
+    const full = { id: list.length + 1, ...doc };
+    list.push(full);
+    return full;
+  }
+  async write() {
+    for (const [name, docs] of Object.entries(this.docs)) {
+      if (docs.length) await col(name).insertMany(docs, { ordered: true });
+      await col('counters').updateOne({ _id: name }, { $set: { seq: docs.length } }, { upsert: true });
+    }
+  }
 }
 
 export async function seedDatabase() {
   const rand = rng(20251110);
   const { seedAdmin } = config;
+  const b = new Batch();
+  const now = new Date();
 
-  await transaction(async (tx) => {
-    // ---- Admin users ----
-    const { rows: adminRows } = await tx.query(
-      `INSERT INTO admin_users (name, username, email, password_hash, role) VALUES ($1,$2,$3,$4,'super_admin') RETURNING id`,
-      [seedAdmin.name, seedAdmin.username, seedAdmin.email.toLowerCase(), await bcrypt.hash(seedAdmin.password, 12)],
-    );
-    const adminId = adminRows[0].id;
-    await tx.query(
-      `INSERT INTO admin_users (name, username, email, password_hash, role) VALUES ($1,$2,$3,$4,'staff')`,
-      ['Store Staff', 'staff', 'staff@bapingarments.com', await bcrypt.hash('Staff@123', 12)],
-    );
-
-    // ---- Categories ----
-    const catIds = {};
-    let order = 0;
-    for (const parent of CATEGORIES) {
-      const { rows } = await tx.query(
-        'INSERT INTO product_categories (name, slug, description, image_url, sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING id',
-        [parent.name, parent.slug, parent.description, parent.image, order++],
-      );
-      catIds[parent.slug] = rows[0].id;
-      let childOrder = 0;
-      for (const [name, slug, image] of parent.children) {
-        const r = await tx.query(
-          'INSERT INTO product_categories (name, slug, parent_id, image_url, sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING id',
-          [name, slug, catIds[parent.slug], image, childOrder++],
-        );
-        catIds[slug] = r.rows[0].id;
-      }
-    }
-
-    // ---- Products, images, variants, inventory & stock history ----
-    const productIds = {};
-    for (const p of PRODUCTS) {
-      const created = daysAgo(p.age, Math.floor(rand() * 10));
-      const flags = Object.fromEntries(Object.values(FLAG_MAP).map((f) => [f, false]));
-      for (const f of p.flags) flags[FLAG_MAP[f]] = true;
-
-      const { rows } = await tx.query(
-        `INSERT INTO products (name, slug, sku, category_id, description, fabric, original_price, discount_price,
-           is_new_arrival, is_featured, is_best_seller, is_trending, view_count, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14) RETURNING id`,
-        [p.name, slugify(p.name), p.sku, catIds[p.cat], p.desc, p.fabric, p.mrp, p.price, flags.is_new_arrival,
-          flags.is_featured, flags.is_best_seller, flags.is_trending, p.views, created],
-      );
-      const pid = rows[0].id;
-      productIds[p.sku] = pid;
-
-      for (const [i, url] of p.images.entries()) {
-        await tx.query(
-          'INSERT INTO product_images (product_id, url, alt_text, sort_order, is_primary) VALUES ($1,$2,$3,$4,$5)',
-          [pid, url, p.name, i, i === 0],
-        );
-      }
-
-      for (const [colorName, hex] of p.colors) {
-        for (const size of p.sizes) {
-          const vsku = `${p.sku}-${size}-${colorName}`.toUpperCase().replace(/[^A-Z0-9-]+/g, '');
-          const { rows: vr } = await tx.query(
-            'INSERT INTO product_variants (product_id, size, color, color_hex, sku, created_at) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
-            [pid, size, colorName, hex, vsku, created],
-          );
-          const vid = vr[0].id;
-
-          // Target closing quantity
-          let target;
-          if (p.stock === 'out') target = 0;
-          else if (p.stock === 'low') target = Math.floor(rand() * 3);
-          else target = rand() < 0.08 ? 0 : rand() < 0.15 ? 2 + Math.floor(rand() * 3) : 6 + Math.floor(rand() * 22);
-
-          // Generate history: opening stock, a few sales (OUT) and maybe a restock (IN).
-          const sales = [];
-          const nSales = Math.floor(rand() * 4) + (p.stock === 'out' ? 2 : 0);
-          for (let s = 0; s < nSales; s++) sales.push(1 + Math.floor(rand() * 4));
-          let restock = p.age > 60 && rand() < 0.4 ? 5 + Math.floor(rand() * 10) : 0;
-          if (restock > target) restock = 0; // keeps opening >= total sales so balance never dips below zero
-          const totalOut = sales.reduce((a, b) => a + b, 0);
-          const opening = Math.max(0, target + totalOut - restock);
-
-          const events = [{ type: 'IN', qty: opening, at: created, reason: 'Opening stock' }];
-          const span = Math.max(1, p.age - 1);
-          sales.forEach((q) => events.push({ type: 'OUT', qty: q, at: daysAgo(Math.floor(rand() * span), rand() * 8), reason: 'Counter sale' }));
-          if (restock) events.push({ type: 'IN', qty: restock, at: daysAgo(Math.floor(rand() * span), 2), reason: 'Restock from supplier', ref: `PO-${1000 + Math.floor(rand() * 900)}` });
-          events.sort((a, b) => a.at - b.at);
-
-          // Walk events in date order; guard against going negative.
-          let bal = 0;
-          for (const e of events) {
-            if (e.qty <= 0) continue;
-            if (e.type === 'OUT') {
-              const q = Math.min(e.qty, bal);
-              if (q <= 0) continue;
-              bal -= q;
-              e.qty = q;
-            } else {
-              bal += e.qty;
-            }
-            await tx.query(
-              `INSERT INTO stock_transactions (product_id, variant_id, variant_label, type, quantity, balance_after, reason, reference, admin_user_id, created_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-              [pid, vid, `${size} / ${colorName}`, e.type, e.qty, bal, e.reason, e.ref || null, adminId, e.at],
-            );
-          }
-          // Reconcile to target with an adjustment if the walk diverged.
-          if (bal !== target) {
-            await tx.query(
-              `INSERT INTO stock_transactions (product_id, variant_id, variant_label, type, quantity, balance_after, reason, admin_user_id, created_at)
-               VALUES ($1,$2,$3,'ADJUST',$4,$5,'Stock audit correction',$6,$7)`,
-              [pid, vid, `${size} / ${colorName}`, target - bal, target, adminId, daysAgo(0, 1)],
-            );
-          }
-          await tx.query('INSERT INTO inventory (variant_id, quantity) VALUES ($1,$2)', [vid, target]);
-        }
-      }
-    }
-
-    // ---- Customers & enquiries ----
-    for (const e of ENQUIRIES) {
-      const created = daysAgo(e.days, Math.floor(rand() * 9));
-      const { rows: c } = await tx.query(
-        `INSERT INTO customers (name, mobile, email, whatsapp_consent, created_at) VALUES ($1,$2,$3,TRUE,$4)
-         ON CONFLICT (mobile) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
-        [e.name, e.mobile, e.email || null, created],
-      );
-      const pid = e.sku ? productIds[e.sku] : null;
-      const prod = PRODUCTS.find((p) => p.sku === e.sku);
-      const { rows: er } = await tx.query(
-        `INSERT INTO customer_enquiries (customer_id, name, mobile, email, subject, product_id, product_name, message, status, internal_remarks, source, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12) RETURNING id`,
-        [c[0].id, e.name, e.mobile, e.email || null, e.subject, pid, prod ? `${prod.name} (${prod.sku})` : null, e.message,
-          e.status, e.remarks || null, pid ? 'product_page' : 'contact_form', created],
-      );
-      if (pid) await tx.query('UPDATE products SET enquiry_count = enquiry_count + 1 WHERE id = $1', [pid]);
-      await tx.query(
-        `INSERT INTO whatsapp_notification_logs (enquiry_id, to_number, message, status, error, created_at)
-         VALUES ($1, '919876543210', $2, 'skipped', 'WhatsApp API credentials not configured', $3)`,
-        [er[0].id, `New enquiry from ${e.name}`, created],
-      );
-    }
+  // ---- Admin users ----
+  const adminBase = { is_active: true, failed_logins: 0, locked_until: null, last_login_at: null, reset_token_hash: null, reset_token_expires: null, created_at: now, updated_at: now };
+  const admin = b.add('admin_users', {
+    name: seedAdmin.name,
+    username: seedAdmin.username,
+    email: seedAdmin.email.toLowerCase(),
+    password_hash: await bcrypt.hash(seedAdmin.password, 12),
+    role: 'super_admin',
+    ...adminBase,
   });
+  b.add('admin_users', {
+    name: 'Store Staff',
+    username: 'staff',
+    email: 'staff@bapingarments.com',
+    password_hash: await bcrypt.hash('Staff@123', 12),
+    role: 'staff',
+    ...adminBase,
+  });
+  const adminId = admin.id;
 
-  const counts = await one(
-    `SELECT (SELECT COUNT(*) FROM products)::int AS products, (SELECT COUNT(*) FROM product_variants)::int AS variants,
-            (SELECT COUNT(*) FROM product_categories)::int AS categories, (SELECT COUNT(*) FROM customer_enquiries)::int AS enquiries`,
-  );
-  console.log(`[seed] done: ${counts.categories} categories, ${counts.products} products, ${counts.variants} variants, ${counts.enquiries} enquiries`);
-  console.log(`[seed] admin login -> username: ${seedAdmin.username}  password: ${seedAdmin.password}`);
+  // ---- Categories ----
+  const catIds = {};
+  let order = 0;
+  for (const parent of CATEGORIES) {
+    const pc = b.add('product_categories', {
+      name: parent.name,
+      slug: parent.slug,
+      parent_id: null,
+      description: parent.description,
+      image_url: parent.image,
+      sort_order: order++,
+      is_active: true,
+      created_at: now,
+      updated_at: now,
+    });
+    catIds[parent.slug] = pc.id;
+    let childOrder = 0;
+    for (const [name, slug, image] of parent.children) {
+      catIds[slug] = b.add('product_categories', {
+        name,
+        slug,
+        parent_id: pc.id,
+        description: null,
+        image_url: image,
+        sort_order: childOrder++,
+        is_active: true,
+        created_at: now,
+        updated_at: now,
+      }).id;
+    }
+  }
+
+  // ---- Products, images, variants, inventory & stock history ----
+  const products = {};
+  const stockEvents = [];
+  for (const p of PRODUCTS) {
+    const created = daysAgo(p.age, Math.floor(rand() * 10));
+    const flags = Object.fromEntries(Object.values(FLAG_MAP).map((f) => [f, false]));
+    for (const f of p.flags) flags[FLAG_MAP[f]] = true;
+
+    const prod = b.add('products', {
+      name: p.name,
+      slug: slugify(p.name),
+      sku: p.sku,
+      category_id: catIds[p.cat],
+      description: p.desc,
+      fabric: p.fabric,
+      original_price: p.mrp,
+      discount_price: p.price ?? null,
+      ...flags,
+      is_active: true,
+      low_stock_threshold: null,
+      view_count: p.views,
+      enquiry_count: 0,
+      created_at: created,
+      updated_at: created,
+    });
+    products[p.sku] = prod;
+
+    for (const [i, url] of p.images.entries()) {
+      b.add('product_images', { product_id: prod.id, url, storage_key: null, alt_text: p.name, sort_order: i, is_primary: i === 0, created_at: created });
+    }
+
+    for (const [colorName, hex] of p.colors) {
+      for (const size of p.sizes) {
+        const vsku = `${p.sku}-${size}-${colorName}`.toUpperCase().replace(/[^A-Z0-9-]+/g, '');
+        const v = b.add('product_variants', { product_id: prod.id, size, color: colorName, color_hex: hex, sku: vsku, is_active: true, created_at: created });
+
+        // Target closing quantity
+        let target;
+        if (p.stock === 'out') target = 0;
+        else if (p.stock === 'low') target = Math.floor(rand() * 3);
+        else target = rand() < 0.08 ? 0 : rand() < 0.15 ? 2 + Math.floor(rand() * 3) : 6 + Math.floor(rand() * 22);
+
+        // Generate history: opening stock, a few sales (OUT) and maybe a restock (IN).
+        const sales = [];
+        const nSales = Math.floor(rand() * 4) + (p.stock === 'out' ? 2 : 0);
+        for (let s = 0; s < nSales; s++) sales.push(1 + Math.floor(rand() * 4));
+        let restock = p.age > 60 && rand() < 0.4 ? 5 + Math.floor(rand() * 10) : 0;
+        if (restock > target) restock = 0; // keeps opening >= total sales so balance never dips below zero
+        const totalOut = sales.reduce((a, c) => a + c, 0);
+        const opening = Math.max(0, target + totalOut - restock);
+
+        const events = [{ type: 'IN', qty: opening, at: created, reason: 'Opening stock' }];
+        const span = Math.max(1, p.age - 1);
+        sales.forEach((q) => events.push({ type: 'OUT', qty: q, at: daysAgo(Math.floor(rand() * span), rand() * 8), reason: 'Counter sale' }));
+        if (restock) events.push({ type: 'IN', qty: restock, at: daysAgo(Math.floor(rand() * span), 2), reason: 'Restock from supplier', ref: `PO-${1000 + Math.floor(rand() * 900)}` });
+        events.sort((a, c) => a.at - c.at);
+
+        // Walk events in date order; guard against going negative.
+        const label = `${size} / ${colorName}`;
+        let bal = 0;
+        for (const e of events) {
+          if (e.qty <= 0) continue;
+          if (e.type === 'OUT') {
+            const q = Math.min(e.qty, bal);
+            if (q <= 0) continue;
+            bal -= q;
+            e.qty = q;
+          } else {
+            bal += e.qty;
+          }
+          stockEvents.push({ product_id: prod.id, variant_id: v.id, variant_label: label, type: e.type, quantity: e.qty, balance_after: bal, reason: e.reason, reference: e.ref || null, admin_user_id: adminId, created_at: e.at });
+        }
+        // Reconcile to target with an adjustment if the walk diverged.
+        if (bal !== target) {
+          stockEvents.push({ product_id: prod.id, variant_id: v.id, variant_label: label, type: 'ADJUST', quantity: target - bal, balance_after: target, reason: 'Stock audit correction', reference: null, admin_user_id: adminId, created_at: daysAgo(0, 1) });
+        }
+        b.add('inventory', { variant_id: v.id, quantity: target, updated_at: now });
+      }
+    }
+  }
+  // Ids follow creation order, like the SQL version.
+  stockEvents.forEach((e) => b.add('stock_transactions', e));
+
+  // ---- Customers & enquiries ----
+  const customers = new Map();
+  for (const e of ENQUIRIES) {
+    const created = daysAgo(e.days, Math.floor(rand() * 9));
+    let cust = customers.get(e.mobile);
+    if (cust) cust.name = e.name;
+    else {
+      cust = b.add('customers', { name: e.name, mobile: e.mobile, email: e.email || null, whatsapp_consent: true, created_at: created, updated_at: created });
+      customers.set(e.mobile, cust);
+    }
+    const prod = e.sku ? products[e.sku] : null;
+    const enq = b.add('customer_enquiries', {
+      customer_id: cust.id,
+      name: e.name,
+      mobile: e.mobile,
+      email: e.email || null,
+      subject: e.subject,
+      product_id: prod?.id ?? null,
+      product_name: prod ? `${prod.name} (${prod.sku})` : null,
+      message: e.message,
+      status: e.status,
+      internal_remarks: e.remarks || null,
+      source: prod ? 'product_page' : 'contact_form',
+      ip_address: null,
+      created_at: created,
+      updated_at: created,
+    });
+    if (prod) prod.enquiry_count += 1;
+    b.add('whatsapp_notification_logs', {
+      enquiry_id: enq.id,
+      to_number: '919876543210',
+      message: `New enquiry from ${e.name}`,
+      template_name: null,
+      status: 'skipped',
+      provider_message_id: null,
+      error: 'WhatsApp API credentials not configured',
+      created_at: created,
+    });
+  }
+
+  await b.write();
+
+  const c = (name) => b.docs[name]?.length || 0;
+  console.log(`[seed] done: ${c('product_categories')} categories, ${c('products')} products, ${c('product_variants')} variants, ${c('customer_enquiries')} enquiries`);
+  console.log(`[seed] admin login -> username: ${seedAdmin.username}  password: ${config.isProd ? '(value of SEED_ADMIN_PASSWORD)' : seedAdmin.password}`);
   console.log('[seed] staff login -> username: staff  password: Staff@123');
   console.log('[seed] CHANGE THESE PASSWORDS after first login.');
 }
@@ -192,8 +244,8 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   (async () => {
     await initDb();
     const reset = process.argv.includes('--reset');
-    const existing = await one('SELECT COUNT(*)::int AS n FROM admin_users');
-    if (existing.n > 0 && !reset) {
+    const existing = await col('admin_users').countDocuments();
+    if (existing > 0 && !reset) {
       console.log('[seed] database already has data. Use `npm run seed -- --reset` to wipe and re-seed.');
     } else {
       if (reset) {

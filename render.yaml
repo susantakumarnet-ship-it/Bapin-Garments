@@ -1,12 +1,5 @@
-# Render Blueprint: one web service (API + built React site) and a PostgreSQL database.
+# Render Blueprint: one web service (API + built React site) using MongoDB Atlas.
 # Dashboard -> New -> Blueprint -> pick this repo. See docs/DEPLOYMENT.md.
-databases:
-  - name: bapin-db
-    plan: free            # free databases expire after 30 days; use basic-256mb or higher for the live shop
-    region: singapore
-    databaseName: bapin
-    user: bapin
-
 services:
   - type: web
     name: bapin-garments
@@ -21,15 +14,17 @@ services:
         value: production
       - key: NODE_VERSION
         value: "22"
-      - key: DATABASE_URL
-        fromDatabase:
-          name: bapin-db
-          property: connectionString
+      # MongoDB Atlas connection string (Atlas -> Connect -> Drivers). In Atlas
+      # "Network Access", allow 0.0.0.0/0 so Render can connect.
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: BapinGarments
       - key: JWT_SECRET
         generateValue: true
       - key: ENCRYPTION_KEY
         generateValue: true
-      # First admin account, created on first boot (8+ characters, letters and numbers).
+      # First admin account, created on first boot of an empty database (8+ characters, letters and numbers).
       - key: SEED_ADMIN_EMAIL
         sync: false
       - key: SEED_ADMIN_PASSWORD

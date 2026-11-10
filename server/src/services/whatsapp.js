@@ -9,7 +9,7 @@
  * pre-approved message TEMPLATE unless the owner messaged the business number in
  * the last 24 hours. See docs/WHATSAPP_SETUP.md for the template to register.
  */
-import { query, one } from '../db/index.js';
+import { col, insert } from '../db/index.js';
 import { config } from '../config.js';
 import { getAllSettings } from './settings.js';
 import { digitsOnly } from '../utils/helpers.js';
@@ -53,12 +53,16 @@ const clean = (v, max = 900) =>
     .slice(0, max);
 
 async function logResult({ enquiryId, to, text, template, status, providerId, error }) {
-  await query(
-    `INSERT INTO whatsapp_notification_logs
-       (enquiry_id, to_number, message, template_name, status, provider_message_id, error)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-    [enquiryId || null, to || null, text, template || null, status, providerId || null, error || null],
-  );
+  await insert('whatsapp_notification_logs', {
+    enquiry_id: enquiryId || null,
+    to_number: to || null,
+    message: text,
+    template_name: template || null,
+    status,
+    provider_message_id: providerId || null,
+    error: error || null,
+    created_at: new Date(),
+  });
 }
 
 /** Low level send. Returns { ok, id?, error? }. */
@@ -161,7 +165,7 @@ export async function sendTestMessage() {
 
 export async function whatsappStatus() {
   const c = await resolveCredentials();
-  const last = await one('SELECT status, created_at, error FROM whatsapp_notification_logs ORDER BY id DESC LIMIT 1');
+  const last = await col('whatsapp_notification_logs').findOne({}, { sort: { id: -1 }, projection: { _id: 0, status: 1, created_at: 1, error: 1 } });
   return {
     configured: Boolean(c.token && c.phoneNumberId),
     token_source: config.whatsapp.accessToken ? 'environment' : c.token ? 'settings' : 'none',

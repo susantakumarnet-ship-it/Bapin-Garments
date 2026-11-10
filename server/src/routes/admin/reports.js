@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
-import { query } from '../../db/index.js';
+import { col, NO_ID } from '../../db/index.js';
 import { ah, HttpError, toInt } from '../../utils/helpers.js';
-import { getLowStockThreshold, getAllSettings } from '../../services/settings.js';
-import { productStockCte, stockStatusSql, STATUS_LABEL } from '../../services/inventory.js';
+import { getAllSettings } from '../../services/settings.js';
+import { stockStatus, STATUS_LABEL } from '../../services/inventory.js';
+import { categoryTree, loadCatalog } from '../../services/catalog.js';
 import { discountPercent, sizeRank } from '../../services/products.js';
-import { enquiryWhere } from './enquiries.js';
+import { enquiryFilter } from './enquiries.js';
 
 const router = Router();
 
@@ -15,31 +16,40 @@ const MAROON = '7A1F2B';
 
 // ---------------------------------------------------------------- report builders
 
-function categoryFilter(q, params, alias = 'p') {
+/** Catalogue, optionally limited to a category (and its sub-categories). */
+async function catalogFor(q) {
+  const cat = await loadCatalog();
   const id = toInt(q.category_id);
-  if (!id) return 'TRUE';
-  params.push(id);
-  return `${alias}.category_id IN (WITH RECURSIVE tree AS (SELECT id FROM product_categories WHERE id = $${params.length}
-            UNION ALL SELECT c2.id FROM product_categories c2 JOIN tree t ON c2.parent_id = t.id) SELECT id FROM tree)`;
+  if (id) {
+    const ids = categoryTree(cat.categories, (c) => c.id === id);
+    cat.products = cat.products.filter((p) => ids.has(p.category_id));
+  }
+  return cat;
 }
 
 async function variantStockRows(q, statusFilter) {
-  const threshold = await getLowStockThreshold();
-  const params = [threshold];
-  const thr = 'COALESCE(p.low_stock_threshold, $1)';
-  const cat = categoryFilter(q, params);
-  const rows = await query(
-    `SELECT p.sku AS product_sku, p.name AS product_name, c.name AS category, v.sku AS variant_sku, v.size, v.color,
-            COALESCE(i.quantity,0)::int AS quantity, ${thr}::int AS threshold,
-            COALESCE(p.discount_price, p.original_price)::float AS price,
-            ${stockStatusSql('COALESCE(i.quantity,0)', thr)} AS status, i.updated_at
-     FROM product_variants v JOIN products p ON p.id = v.product_id
-     JOIN product_categories c ON c.id = p.category_id
-     LEFT JOIN inventory i ON i.variant_id = v.id
-     WHERE v.is_active AND ${cat} ${statusFilter ? `AND ${stockStatusSql('COALESCE(i.quantity,0)', thr)} = '${statusFilter}'` : ''}
-     ORDER BY c.name, p.name, v.color`,
-    params,
-  );
+  const { products } = await catalogFor(q);
+  const rows = [];
+  for (const p of products) {
+    for (const v of p.variants) {
+      if (!v.is_active) continue;
+      const status = stockStatus(v.quantity, p.threshold);
+      if (statusFilter && status !== statusFilter) continue;
+      rows.push({
+        product_sku: p.sku,
+        product_name: p.name,
+        category: p.category?.name ?? '',
+        variant_sku: v.sku,
+        size: v.size,
+        color: v.color,
+        quantity: v.quantity,
+        threshold: p.threshold,
+        price: p.price,
+        status,
+        updated_at: v.stock_updated_at,
+      });
+    }
+  }
   rows.sort((a, b) => a.category.localeCompare(b.category) || a.product_name.localeCompare(b.product_name) || a.color.localeCompare(b.color) || sizeRank(a.size) - sizeRank(b.size));
   return rows.map((r) => ({ ...r, status: STATUS_LABEL[r.status], value: r.quantity * r.price }));
 }
@@ -57,32 +67,24 @@ const variantColumns = [
   { key: 'status', header: 'Status', width: 12 },
 ];
 
+const byCategoryThenName = (a, b) => (a.category?.name || '').localeCompare(b.category?.name || '') || a.name.localeCompare(b.name);
+
 const REPORTS = {
   products: {
     title: 'Complete Product List',
     async build(q) {
-      const threshold = await getLowStockThreshold();
-      const params = [threshold];
-      const cat = categoryFilter(q, params);
-      const rows = await query(
-        `${productStockCte('$1')}
-         SELECT p.*, c.name AS category, s.total_stock, ${stockStatusSql('s.total_stock', 's.threshold')} AS status,
-                (SELECT COUNT(*)::int FROM product_variants v WHERE v.product_id = p.id) AS variants
-         FROM products p JOIN product_categories c ON c.id = p.category_id JOIN stock s ON s.product_id = p.id
-         WHERE ${cat} ORDER BY c.name, p.name`,
-        params,
-      );
-      return rows.map((r) => ({
+      const { products } = await catalogFor(q);
+      return products.sort(byCategoryThenName).map((r) => ({
         sku: r.sku,
         name: r.name,
-        category: r.category,
+        category: r.category?.name ?? '',
         fabric: r.fabric,
         original_price: r.original_price,
         discount_price: r.discount_price ?? r.original_price,
         discount: discountPercent(r.original_price, r.discount_price),
-        variants: r.variants,
+        variants: r.variants.length,
         stock: r.total_stock,
-        status: STATUS_LABEL[r.status],
+        status: STATUS_LABEL[r.stock_status],
         labels: [r.is_new_arrival && 'New', r.is_featured && 'Featured', r.is_best_seller && 'Best Seller', r.is_trending && 'Trending']
           .filter(Boolean)
           .join(', '),
@@ -110,25 +112,24 @@ const REPORTS = {
   'category-inventory': {
     title: 'Category-wise Inventory',
     async build() {
-      const threshold = await getLowStockThreshold();
-      const rows = await query(
-        `${productStockCte('$1')}
-         SELECT c.name AS category, pc.name AS parent,
-                COUNT(DISTINCT p.id)::int AS products,
-                (SELECT COUNT(*)::int FROM product_variants v JOIN products p2 ON p2.id = v.product_id WHERE p2.category_id = c.id) AS variants,
-                COALESCE(SUM(s.total_stock),0)::int AS units,
-                COUNT(p.id) FILTER (WHERE s.total_stock > 0 AND s.total_stock <= s.threshold)::int AS low,
-                COUNT(p.id) FILTER (WHERE s.total_stock <= 0)::int AS out,
-                COALESCE(SUM(s.total_stock * COALESCE(p.discount_price, p.original_price)),0)::float AS value
-         FROM product_categories c
-         LEFT JOIN product_categories pc ON pc.id = c.parent_id
-         LEFT JOIN products p ON p.category_id = c.id
-         LEFT JOIN stock s ON s.product_id = p.id
-         GROUP BY c.id, c.name, pc.name
-         HAVING COUNT(p.id) > 0
-         ORDER BY pc.name NULLS FIRST, c.name`,
-        [threshold],
-      );
+      const { categories, catById, products } = await loadCatalog();
+      const rows = [];
+      for (const c of categories) {
+        const list = products.filter((p) => p.category_id === c.id);
+        if (!list.length) continue;
+        rows.push({
+          category: c.name,
+          parent: c.parent_id ? catById.get(c.parent_id)?.name || null : null,
+          products: list.length,
+          variants: list.reduce((s, p) => s + p.variants.length, 0),
+          units: list.reduce((s, p) => s + p.total_stock, 0),
+          low: list.filter((p) => p.total_stock > 0 && p.total_stock <= p.threshold).length,
+          out: list.filter((p) => p.total_stock <= 0).length,
+          value: list.reduce((s, p) => s + p.total_stock * p.price, 0),
+        });
+      }
+      // Top-level rows first (like NULLS FIRST), then by department and category name.
+      rows.sort((a, b) => (a.parent ? 1 : 0) - (b.parent ? 1 : 0) || (a.parent || '').localeCompare(b.parent || '') || a.category.localeCompare(b.category));
       return rows.map((r) => ({ ...r, parent: r.parent || '—' }));
     },
     columns: [
@@ -167,9 +168,7 @@ const REPORTS = {
   enquiries: {
     title: 'Customer Enquiry Report',
     async build(q) {
-      const w = enquiryWhere(q);
-      const rows = await query(`SELECT e.* FROM customer_enquiries e ${w.sql} ORDER BY e.created_at DESC`, w.params);
-      return rows;
+      return col('customer_enquiries').find(enquiryFilter(q), NO_ID).sort({ created_at: -1 }).toArray();
     },
     columns: [
       { key: 'id', header: 'ID', width: 6, type: 'int' },
@@ -190,37 +189,51 @@ const REPORTS = {
     subtitle: (q) => `Month: ${monthOf(q)}`,
     async build(q) {
       const month = monthOf(q);
-      const params = [`${month}-01`];
-      const cat = categoryFilter(q, params);
+      const start = new Date(`${month}-01T00:00:00.000Z`);
+      const finish = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1));
+      const { products } = await catalogFor(q);
       // Net movement per type: IN adds, OUT removes, ADJUST stores a signed delta.
-      const rows = await query(
-        `WITH bounds AS (SELECT $1::date AS start, ($1::date + INTERVAL '1 month') AS finish),
-         cur AS (
-           SELECT p.id, COALESCE(SUM(i.quantity),0)::int AS current
-           FROM products p LEFT JOIN product_variants v ON v.product_id = p.id LEFT JOIN inventory i ON i.variant_id = v.id
-           GROUP BY p.id
-         ),
-         mv AS (
-           SELECT t.product_id,
-             COALESCE(SUM(CASE WHEN t.type='IN' THEN t.quantity END) FILTER (WHERE t.created_at >= b.start AND t.created_at < b.finish),0)::int AS stock_in,
-             COALESCE(SUM(CASE WHEN t.type='OUT' THEN t.quantity END) FILTER (WHERE t.created_at >= b.start AND t.created_at < b.finish),0)::int AS stock_out,
-             COALESCE(SUM(CASE WHEN t.type='ADJUST' THEN t.quantity END) FILTER (WHERE t.created_at >= b.start AND t.created_at < b.finish),0)::int AS adjust,
-             COALESCE(SUM(CASE WHEN t.type='OUT' THEN -t.quantity ELSE t.quantity END) FILTER (WHERE t.created_at >= b.finish),0)::int AS after_net
-           FROM stock_transactions t CROSS JOIN bounds b GROUP BY t.product_id
-         )
-         SELECT p.sku, p.name, c.name AS category,
-                COALESCE(mv.stock_in,0) AS stock_in, COALESCE(mv.stock_out,0) AS stock_out, COALESCE(mv.adjust,0) AS adjust,
-                (cur.current - COALESCE(mv.after_net,0)) AS closing
-         FROM products p
-         JOIN product_categories c ON c.id = p.category_id
-         JOIN cur ON cur.id = p.id
-         LEFT JOIN mv ON mv.product_id = p.id
-         CROSS JOIN bounds b
-         WHERE p.created_at < b.finish AND ${cat}
-         ORDER BY c.name, p.name`,
-        params,
-      );
-      return rows.map((r) => ({ ...r, opening: r.closing - r.stock_in + r.stock_out - r.adjust }));
+      const groups = await col('stock_transactions')
+        .aggregate([
+          { $match: { created_at: { $gte: start } } },
+          {
+            $group: {
+              _id: '$product_id',
+              stock_in: { $sum: { $cond: [{ $and: [{ $eq: ['$type', 'IN'] }, { $lt: ['$created_at', finish] }] }, '$quantity', 0] } },
+              stock_out: { $sum: { $cond: [{ $and: [{ $eq: ['$type', 'OUT'] }, { $lt: ['$created_at', finish] }] }, '$quantity', 0] } },
+              adjust: { $sum: { $cond: [{ $and: [{ $eq: ['$type', 'ADJUST'] }, { $lt: ['$created_at', finish] }] }, '$quantity', 0] } },
+              after_net: {
+                $sum: {
+                  $cond: [
+                    { $gte: ['$created_at', finish] },
+                    { $cond: [{ $eq: ['$type', 'OUT'] }, { $multiply: ['$quantity', -1] }, '$quantity'] },
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ])
+        .toArray();
+      const mv = new Map(groups.map((g) => [g._id, g]));
+      return products
+        .filter((p) => new Date(p.created_at) < finish)
+        .sort(byCategoryThenName)
+        .map((p) => {
+          const m = mv.get(p.id) || { stock_in: 0, stock_out: 0, adjust: 0, after_net: 0 };
+          const current = p.variants.reduce((s, v) => s + v.quantity, 0);
+          const closing = current - m.after_net;
+          return {
+            sku: p.sku,
+            name: p.name,
+            category: p.category?.name ?? '',
+            stock_in: m.stock_in,
+            stock_out: m.stock_out,
+            adjust: m.adjust,
+            closing,
+            opening: closing - m.stock_in + m.stock_out - m.adjust,
+          };
+        });
     },
     columns: [
       { key: 'sku', header: 'SKU', width: 13 },

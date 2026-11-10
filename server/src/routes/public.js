@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one, transaction } from '../db/index.js';
+import { col, insert } from '../db/index.js';
 import { ah, validate, HttpError, digitsOnly } from '../utils/helpers.js';
 import { listProducts, getProduct, sortSizes } from '../services/products.js';
 import { getPublicSettings } from '../services/settings.js';
@@ -18,11 +18,21 @@ router.get(
 router.get(
   '/categories',
   ah(async (_req, res) => {
-    const rows = await query(
-      `SELECT c.id, c.name, c.slug, c.parent_id, c.description, c.image_url, c.sort_order,
-              (SELECT COUNT(*)::int FROM products p WHERE p.category_id = c.id AND p.is_active) AS product_count
-       FROM product_categories c WHERE c.is_active ORDER BY c.sort_order, c.name`,
-    );
+    const [cats, counts] = await Promise.all([
+      col('product_categories')
+        .find(
+          { is_active: true },
+          { projection: { _id: 0, id: 1, name: 1, slug: 1, parent_id: 1, description: 1, image_url: 1, sort_order: 1 } },
+        )
+        .toArray(),
+      col('products')
+        .aggregate([{ $match: { is_active: true } }, { $group: { _id: '$category_id', n: { $sum: 1 } } }])
+        .toArray(),
+    ]);
+    const countBy = new Map(counts.map((c) => [c._id, c.n]));
+    const rows = cats
+      .map((c) => ({ ...c, product_count: countBy.get(c.id) || 0 }))
+      .sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name));
     res.json(buildTree(rows));
   }),
 );
@@ -54,7 +64,7 @@ router.get(
   ah(async (req, res) => {
     const product = await getProduct({ slug: req.params.slug }, { publicOnly: true });
     if (!product) throw new HttpError(404, 'Product not found');
-    await query('UPDATE products SET view_count = view_count + 1 WHERE id = $1', [product.id]);
+    await col('products').updateOne({ id: product.id }, { $inc: { view_count: 1 } });
     const related = await listProducts(
       { category_id: product.category_id, exclude_id: product.id, limit: 8, sort: 'popular' },
       { publicOnly: true },
@@ -69,19 +79,28 @@ router.get(
 router.get(
   '/filters',
   ah(async (_req, res) => {
-    const sizes = await query(
-      `SELECT DISTINCT v.size FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.is_active AND p.is_active`,
-    );
-    const colors = await query(
-      `SELECT v.color AS name, MAX(v.color_hex) AS hex, COUNT(DISTINCT v.product_id)::int AS count
-       FROM product_variants v JOIN products p ON p.id = v.product_id
-       WHERE v.is_active AND p.is_active GROUP BY v.color ORDER BY count DESC, v.color`,
-    );
-    const price = await one(
-      `SELECT COALESCE(MIN(COALESCE(discount_price, original_price)),0) AS min,
-              COALESCE(MAX(COALESCE(discount_price, original_price)),0) AS max FROM products WHERE is_active`,
-    );
-    res.json({ sizes: sortSizes(sizes.map((s) => s.size)), colors, price });
+    const products = await col('products')
+      .find({ is_active: true }, { projection: { _id: 0, id: 1, original_price: 1, discount_price: 1 } })
+      .toArray();
+    const activeIds = new Set(products.map((p) => p.id));
+    const variants = (
+      await col('product_variants')
+        .find({ is_active: true }, { projection: { _id: 0, product_id: 1, size: 1, color: 1, color_hex: 1 } })
+        .toArray()
+    ).filter((v) => activeIds.has(v.product_id));
+    const colorMap = new Map();
+    for (const v of variants) {
+      const c = colorMap.get(v.color) || { name: v.color, hex: null, products: new Set() };
+      if (v.color_hex && (!c.hex || v.color_hex > c.hex)) c.hex = v.color_hex;
+      c.products.add(v.product_id);
+      colorMap.set(v.color, c);
+    }
+    const colors = [...colorMap.values()]
+      .map((c) => ({ name: c.name, hex: c.hex, count: c.products.size }))
+      .sort((a, b) => b.count - a.count || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    const prices = products.map((p) => p.discount_price ?? p.original_price);
+    const price = { min: prices.length ? Math.min(...prices) : 0, max: prices.length ? Math.max(...prices) : 0 };
+    res.json({ sizes: sortSizes([...new Set(variants.map((v) => v.size))]), colors, price });
   }),
 );
 
@@ -136,32 +155,63 @@ router.post(
     let productName = data.product_name || null;
     let productId = null;
     if (data.product_id) {
-      const p = await one('SELECT id, name, sku FROM products WHERE id = $1', [data.product_id]);
+      const p = await col('products').findOne({ id: data.product_id }, { projection: { _id: 0, id: 1, name: 1, sku: 1 } });
       if (p) {
         productId = p.id;
         productName = productName || `${p.name} (${p.sku})`;
       }
     }
 
-    const enquiry = await transaction(async (tx) => {
-      const { rows: cust } = await tx.query(
-        `INSERT INTO customers (name, mobile, email, whatsapp_consent)
-         VALUES ($1, $2, NULLIF($3, ''), $4)
-         ON CONFLICT (mobile) DO UPDATE SET name = EXCLUDED.name,
-           email = COALESCE(EXCLUDED.email, customers.email),
-           whatsapp_consent = customers.whatsapp_consent OR EXCLUDED.whatsapp_consent,
-           updated_at = NOW()
-         RETURNING id`,
-        [data.name, mobile, data.email || '', data.consent],
+    const now = new Date();
+    const existing = await col('customers').findOne({ mobile });
+    let customerId;
+    if (existing) {
+      customerId = existing.id;
+      await col('customers').updateOne(
+        { id: existing.id },
+        {
+          $set: {
+            name: data.name,
+            email: data.email || existing.email || null,
+            whatsapp_consent: Boolean(existing.whatsapp_consent || data.consent),
+            updated_at: now,
+          },
+        },
       );
-      const { rows } = await tx.query(
-        `INSERT INTO customer_enquiries (customer_id, name, mobile, email, subject, product_id, product_name, message, source, ip_address)
-         VALUES ($1,$2,$3,NULLIF($4,''),$5,$6,$7,$8,$9,$10) RETURNING *`,
-        [cust[0].id, data.name, mobile, data.email || '', data.subject, productId, productName, data.message, data.source, req.ip],
-      );
-      if (productId) await tx.query('UPDATE products SET enquiry_count = enquiry_count + 1 WHERE id = $1', [productId]);
-      return rows[0];
+    } else {
+      try {
+        customerId = (
+          await insert('customers', {
+            name: data.name,
+            mobile,
+            email: data.email || null,
+            whatsapp_consent: data.consent,
+            created_at: now,
+            updated_at: now,
+          })
+        ).id;
+      } catch (err) {
+        if (err?.code !== 11000) throw err; // same mobile submitted twice at once
+        customerId = (await col('customers').findOne({ mobile })).id;
+      }
+    }
+    const enquiry = await insert('customer_enquiries', {
+      customer_id: customerId,
+      name: data.name,
+      mobile,
+      email: data.email || null,
+      subject: data.subject,
+      product_id: productId,
+      product_name: productName,
+      message: data.message,
+      status: 'New',
+      internal_remarks: null,
+      source: data.source,
+      ip_address: req.ip,
+      created_at: now,
+      updated_at: now,
     });
+    if (productId) await col('products').updateOne({ id: productId }, { $inc: { enquiry_count: 1 } });
 
     // Fire-and-forget: the customer should not wait for the WhatsApp API.
     notifyOwnerOfEnquiry(enquiry);

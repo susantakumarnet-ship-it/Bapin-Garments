@@ -1,4 +1,4 @@
-import { query } from '../db/index.js';
+import { col } from '../db/index.js';
 import { encrypt, decrypt } from './crypto.js';
 
 /**
@@ -54,7 +54,7 @@ export function invalidateSettings() {
 /** All settings with secrets decrypted — server-side use only. */
 export async function getAllSettings() {
   if (cache) return cache;
-  const rows = await query('SELECT key, value, is_secret FROM website_settings');
+  const rows = await col('website_settings').find({}).toArray();
   const out = {};
   for (const [k, def] of Object.entries(SETTINGS_SCHEMA)) out[k] = def.default;
   for (const r of rows) out[r.key] = r.is_secret ? decrypt(r.value) : r.value;
@@ -93,11 +93,10 @@ export async function updateSettings(patch) {
     // Empty secret = "keep existing value" so the masked field can be left blank.
     if (def.secret && (v === undefined || v === null || v === '')) continue;
     const value = def.secret ? encrypt(String(v)) : String(v ?? '');
-    await query(
-      `INSERT INTO website_settings (key, value, is_secret, updated_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, is_secret = EXCLUDED.is_secret, updated_at = NOW()`,
-      [k, value, Boolean(def.secret)],
+    await col('website_settings').updateOne(
+      { key: k },
+      { $set: { value, is_secret: Boolean(def.secret), updated_at: new Date() } },
+      { upsert: true },
     );
   }
   invalidateSettings();
@@ -105,7 +104,7 @@ export async function updateSettings(patch) {
 
 export async function clearSecret(key) {
   if (!SETTINGS_SCHEMA[key]?.secret) return;
-  await query('DELETE FROM website_settings WHERE key = $1', [key]);
+  await col('website_settings').deleteOne({ key });
   invalidateSettings();
 }
 

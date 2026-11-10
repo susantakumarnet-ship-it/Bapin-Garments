@@ -7,6 +7,34 @@ export const SERVER_ROOT = path.resolve(__dirname, '..');
 
 const isProd = process.env.NODE_ENV === 'production';
 // Render injects the service's public URL; use it when PUBLIC_SITE_URL / CORS_ORIGINS aren't set.
+/**
+ * MongoDB connection string from MONGODB_URI (or DATABASE_URL). Passwords pasted
+ * from Atlas often contain characters such as @ that must be URL-encoded; fix that
+ * here so a raw password still works.
+ */
+function normaliseMongoUri(raw) {
+  const uri = String(raw || '').trim();
+  const m = uri.match(/^(mongodb(?:\+srv)?:\/\/)([^/?#]*)@([^@]*)$/);
+  if (!m) return uri;
+  const [, scheme, userinfo, rest] = m;
+  const i = userinfo.indexOf(':');
+  const enc = (v) => {
+    let decoded = v;
+    try {
+      decoded = decodeURIComponent(v);
+    } catch {
+      /* keep raw */
+    }
+    return encodeURIComponent(decoded);
+  };
+  const fixed = i < 0 ? enc(userinfo) : `${enc(userinfo.slice(0, i))}:${enc(userinfo.slice(i + 1))}`;
+  return `${scheme}${fixed}@${rest}`;
+}
+const dbNameFromUri = (uri) => uri.match(/^mongodb(?:\+srv)?:\/\/[^/]+\/([^?]+)/)?.[1] || '';
+const mongoUri = normaliseMongoUri(
+  process.env.MONGODB_URI || (/^mongodb/.test(process.env.DATABASE_URL || '') ? process.env.DATABASE_URL : ''),
+);
+
 const hostUrl = process.env.RENDER_EXTERNAL_URL || '';
 
 // In production, missing secrets are generated once and stored in the database
@@ -17,9 +45,8 @@ const jwtSecret = process.env.JWT_SECRET || devSecret;
 export const config = {
   isProd,
   port: Number(process.env.PORT) || 4000,
-  databaseUrl: process.env.DATABASE_URL || '',
-  databaseSsl: process.env.DATABASE_SSL === 'true',
-  pgliteDir: path.resolve(SERVER_ROOT, process.env.PGLITE_DIR || 'data/pglite'),
+  mongoUri,
+  mongoDbName: process.env.MONGODB_DB || dbNameFromUri(mongoUri) || 'BapinGarments',
   jwtSecret,
   // Used to encrypt secrets (e.g. WhatsApp token) stored in the database.
   encryptionKey: process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || devSecret,

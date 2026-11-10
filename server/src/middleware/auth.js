@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
-import { one } from '../db/index.js';
+import { col } from '../db/index.js';
 import { HttpError } from '../utils/helpers.js';
 
 export const AUTH_COOKIE = 'bg_admin_token';
@@ -56,9 +56,9 @@ export async function requireAuth(req, _res, next) {
     } catch {
       throw new HttpError(401, 'Session expired. Please log in again');
     }
-    const user = await one(
-      'SELECT id, name, username, email, role, is_active, updated_at FROM admin_users WHERE id = $1',
-      [payload.sub],
+    const user = await col('admin_users').findOne(
+      { id: Number(payload.sub) },
+      { projection: { _id: 0, id: 1, name: 1, username: 1, email: 1, role: 1, is_active: 1, updated_at: 1 } },
     );
     if (!user || !user.is_active) throw new HttpError(401, 'Account disabled or not found');
     // Invalidate tokens issued before a password change / role change.

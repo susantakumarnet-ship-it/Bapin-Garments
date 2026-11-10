@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, transaction } from '../../db/index.js';
-import { ah, validate, Where, pageParams, toInt } from '../../utils/helpers.js';
+import { col, dateRange, likeRegex } from '../../db/index.js';
+import { ah, validate, pageParams, toInt } from '../../utils/helpers.js';
 import { can } from '../../middleware/auth.js';
-import { applyStockMovement, stockStatusSql } from '../../services/inventory.js';
-import { getLowStockThreshold } from '../../services/settings.js';
+import { applyStockMovement, stockStatus, validateMovements } from '../../services/inventory.js';
+import { categoryTree, loadCatalog, mapById, paginate } from '../../services/catalog.js';
 
 const router = Router();
 
@@ -12,52 +12,47 @@ const router = Router();
 router.get(
   '/',
   ah(async (req, res) => {
-    const threshold = await getLowStockThreshold();
-    const w = new Where();
-    w.params.push(threshold); // $1
-    const thr = 'COALESCE(p.low_stock_threshold, $1)';
-    if (req.query.q) {
-      const t = `%${String(req.query.q).slice(0, 80)}%`;
-      w.add('(p.name ILIKE ? OR p.sku ILIKE ? OR v.sku ILIKE ? OR v.color ILIKE ?)', t, t, t, t);
+    const q = req.query;
+    const { categories, products } = await loadCatalog();
+    const re = q.q ? likeRegex(q.q) : null;
+    const catIds = toInt(q.category_id) ? categoryTree(categories, (c) => c.id === toInt(q.category_id)) : null;
+    const color = q.color ? String(q.color).toLowerCase() : null;
+    const status = ['in_stock', 'low_stock', 'out_of_stock'].includes(q.stock_status) ? q.stock_status : null;
+
+    const all = [];
+    const totals = { units: 0, variants: 0 };
+    for (const p of products) {
+      if (catIds && !catIds.has(p.category_id)) continue;
+      if (toInt(q.product_id) && p.id !== toInt(q.product_id)) continue;
+      for (const v of p.variants) {
+        if (re && ![p.name, p.sku, v.sku, v.color].some((x) => x && re.test(x))) continue;
+        if (q.size && v.size !== String(q.size)) continue;
+        if (color && v.color.toLowerCase() !== color) continue;
+        const st = stockStatus(v.quantity, p.threshold);
+        if (status && st !== status) continue;
+        totals.units += v.quantity;
+        totals.variants += 1;
+        all.push({
+          variant_id: v.id,
+          size: v.size,
+          color: v.color,
+          color_hex: v.color_hex,
+          variant_sku: v.sku,
+          is_active: v.is_active,
+          product_id: p.id,
+          product_name: p.name,
+          product_sku: p.sku,
+          category_name: p.category?.name ?? null,
+          quantity: v.quantity,
+          threshold: p.threshold,
+          updated_at: v.stock_updated_at,
+          stock_status: st,
+          image: p.images[0]?.url ?? null,
+        });
+      }
     }
-    if (toInt(req.query.category_id)) {
-      w.add(
-        `p.category_id IN (WITH RECURSIVE tree AS (SELECT id FROM product_categories WHERE id = ?
-           UNION ALL SELECT c2.id FROM product_categories c2 JOIN tree t ON c2.parent_id = t.id) SELECT id FROM tree)`,
-        toInt(req.query.category_id),
-      );
-    }
-    if (toInt(req.query.product_id)) w.add('p.id = ?', toInt(req.query.product_id));
-    if (req.query.size) w.add('v.size = ?', String(req.query.size));
-    if (req.query.color) w.add('LOWER(v.color) = LOWER(?)', String(req.query.color));
-    if (['in_stock', 'low_stock', 'out_of_stock'].includes(req.query.stock_status)) {
-      w.add(`${stockStatusSql('COALESCE(i.quantity,0)', thr)} = ?`, req.query.stock_status);
-    }
-    const { page, limit, offset } = pageParams(req.query, 50, 500);
-    const rows = await query(
-      `SELECT v.id AS variant_id, v.size, v.color, v.color_hex, v.sku AS variant_sku, v.is_active,
-              p.id AS product_id, p.name AS product_name, p.sku AS product_sku, c.name AS category_name,
-              COALESCE(i.quantity,0)::int AS quantity, ${thr}::int AS threshold, i.updated_at,
-              ${stockStatusSql('COALESCE(i.quantity,0)', thr)} AS stock_status,
-              (SELECT url FROM product_images pi WHERE pi.product_id = p.id ORDER BY pi.is_primary DESC, pi.sort_order LIMIT 1) AS image,
-              COUNT(*) OVER()::int AS total_count
-       FROM product_variants v
-       JOIN products p ON p.id = v.product_id
-       JOIN product_categories c ON c.id = p.category_id
-       LEFT JOIN inventory i ON i.variant_id = v.id
-       ${w.sql}
-       ORDER BY p.name, v.color, v.size
-       LIMIT ${limit} OFFSET ${offset}`,
-      w.params,
-    );
-    const total = rows[0]?.total_count || 0;
-    const totals = await query(
-      `SELECT COALESCE(SUM(i.quantity),0)::int AS units, COUNT(*)::int AS variants
-       FROM product_variants v JOIN products p ON p.id = v.product_id LEFT JOIN inventory i ON i.variant_id = v.id
-       ${w.sql ? `${w.sql} AND` : 'WHERE'} $1::int IS NOT NULL`,
-      w.params,
-    );
-    res.json({ items: rows, page, limit, total, pages: Math.max(1, Math.ceil(total / limit)), summary: totals[0] });
+    all.sort((a, b) => a.product_name.localeCompare(b.product_name) || a.color.localeCompare(b.color) || a.size.localeCompare(b.size));
+    res.json({ ...paginate(all, pageParams(q, 50, 500)), summary: totals });
   }),
 );
 
@@ -75,22 +70,17 @@ router.post(
   ah(async (req, res) => {
     const items = Array.isArray(req.body.items) ? req.body.items : [req.body];
     const parsed = items.slice(0, 200).map((it) => validate(movementSchema, it));
-    const results = await transaction(async (tx) => {
-      const out = [];
-      for (const m of parsed) {
-        out.push(
-          await applyStockMovement(tx, {
-            variantId: m.variant_id,
-            type: m.type,
-            quantity: m.quantity,
-            reason: m.reason,
-            reference: m.reference,
-            adminUserId: req.user.id,
-          }),
-        );
-      }
-      return out;
-    });
+    const movements = parsed.map((m) => ({
+      variantId: m.variant_id,
+      type: m.type,
+      quantity: m.quantity,
+      reason: m.reason,
+      reference: m.reference,
+      adminUserId: req.user.id,
+    }));
+    await validateMovements(movements); // reject the whole batch before changing anything
+    const results = [];
+    for (const m of movements) results.push(await applyStockMovement(m));
     res.status(201).json({ ok: true, results });
   }),
 );
@@ -99,29 +89,38 @@ router.post(
 router.get(
   '/transactions',
   ah(async (req, res) => {
-    const w = new Where();
-    if (toInt(req.query.product_id)) w.add('t.product_id = ?', toInt(req.query.product_id));
-    if (toInt(req.query.variant_id)) w.add('t.variant_id = ?', toInt(req.query.variant_id));
-    if (['IN', 'OUT', 'ADJUST'].includes(req.query.type)) w.add('t.type = ?', req.query.type);
-    if (req.query.from) w.add('t.created_at >= ?::date', req.query.from);
-    if (req.query.to) w.add(`t.created_at < (?::date + INTERVAL '1 day')`, req.query.to);
-    if (req.query.q) {
-      const t = `%${String(req.query.q).slice(0, 80)}%`;
-      w.add('(p.name ILIKE ? OR p.sku ILIKE ? OR t.reference ILIKE ?)', t, t, t);
+    const q = req.query;
+    const filter = {};
+    if (toInt(q.product_id)) filter.product_id = toInt(q.product_id);
+    if (toInt(q.variant_id)) filter.variant_id = toInt(q.variant_id);
+    if (['IN', 'OUT', 'ADJUST'].includes(q.type)) filter.type = q.type;
+    const range = dateRange(q.from, q.to);
+    if (range) filter.created_at = range;
+    if (q.q) {
+      const re = likeRegex(q.q);
+      const ids = (
+        await col('products')
+          .find({ $or: [{ name: re }, { sku: re }] }, { projection: { id: 1 } })
+          .toArray()
+      ).map((p) => p.id);
+      filter.$or = [{ product_id: { $in: ids } }, { reference: re }];
     }
-    const { page, limit, offset } = pageParams(req.query, 50, 500);
-    const rows = await query(
-      `SELECT t.*, p.name AS product_name, p.sku AS product_sku, a.name AS admin_name, COUNT(*) OVER()::int AS total_count
-       FROM stock_transactions t
-       JOIN products p ON p.id = t.product_id
-       LEFT JOIN admin_users a ON a.id = t.admin_user_id
-       ${w.sql}
-       ORDER BY t.created_at DESC, t.id DESC
-       LIMIT ${limit} OFFSET ${offset}`,
-      w.params,
-    );
-    const total = rows[0]?.total_count || 0;
-    res.json({ items: rows, page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) });
+    const { page, limit, offset } = pageParams(q, 50, 500);
+    const [rows, total] = await Promise.all([
+      col('stock_transactions').find(filter, { projection: { _id: 0 } }).sort({ created_at: -1, id: -1 }).skip(offset).limit(limit).toArray(),
+      col('stock_transactions').countDocuments(filter),
+    ]);
+    const [products, admins] = await Promise.all([
+      mapById('products', rows.map((r) => r.product_id), { name: 1, sku: 1 }),
+      mapById('admin_users', rows.map((r) => r.admin_user_id), { name: 1 }),
+    ]);
+    const items = rows.map((t) => ({
+      ...t,
+      product_name: products.get(t.product_id)?.name ?? null,
+      product_sku: products.get(t.product_id)?.sku ?? null,
+      admin_name: admins.get(t.admin_user_id)?.name ?? null,
+    }));
+    res.json({ items, page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) });
   }),
 );
 

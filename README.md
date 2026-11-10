@@ -6,7 +6,7 @@ A complete clothing-store website with a customer storefront and an admin portal
 |---|---|
 | **Frontend** | React 19 + Vite, Tailwind CSS v4, React Router, Recharts |
 | **Backend** | Node.js + Express REST API |
-| **Database** | PostgreSQL (embedded PGlite Postgres in development; no install needed) |
+| **Database** | MongoDB (MongoDB Atlas or a local server) |
 | **Images** | Local disk, or Cloudinary when `CLOUDINARY_URL` is set |
 | **WhatsApp** | WhatsApp Business Cloud API (Meta Graph API), server-side only |
 | **Reports** | Excel (`exceljs`) and PDF (`pdfkit`) |
@@ -43,7 +43,7 @@ npm run build     # builds the React app into client/dist
 npm start         # Express serves the API and the built website on PORT (default 4000)
 ```
 
-To run with Docker, use `docker compose up -d --build` (PostgreSQL + app). See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+To run with Docker, use `docker compose up -d --build` (MongoDB + app). See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
@@ -86,7 +86,7 @@ BAPIN GARMENTS/
 │       └── lib/            API client, formatting helpers
 ├── server/                 Express API
 │   ├── src/
-│   │   ├── db/             schema.sql, DB layer, seed data
+│   │   ├── db/             MongoDB layer, seed data
 │   │   ├── routes/         auth, public, admin/*
 │   │   ├── services/       inventory, products, whatsapp, settings, storage, crypto, mailer
 │   │   └── middleware/     auth/roles, rate limiting, CSRF, uploads, errors

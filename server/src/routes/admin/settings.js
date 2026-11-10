@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query } from '../../db/index.js';
-import { ah, validate, pageParams, Where } from '../../utils/helpers.js';
+import { col } from '../../db/index.js';
+import { mapById } from '../../services/catalog.js';
+import { ah, validate, pageParams } from '../../utils/helpers.js';
 import { can } from '../../middleware/auth.js';
 import { getAdminSettings, updateSettings, clearSecret, SETTINGS_SCHEMA } from '../../services/settings.js';
 import { sendTestMessage, whatsappStatus } from '../../services/whatsapp.js';
@@ -95,17 +96,15 @@ router.get(
   '/whatsapp/logs',
   can('settings.view'),
   ah(async (req, res) => {
-    const w = new Where();
-    if (['sent', 'failed', 'skipped'].includes(req.query.status)) w.add('l.status = ?', req.query.status);
+    const filter = ['sent', 'failed', 'skipped'].includes(req.query.status) ? { status: req.query.status } : {};
     const { page, limit, offset } = pageParams(req.query, 25, 200);
-    const rows = await query(
-      `SELECT l.*, e.name AS customer_name, COUNT(*) OVER()::int AS total_count
-       FROM whatsapp_notification_logs l LEFT JOIN customer_enquiries e ON e.id = l.enquiry_id
-       ${w.sql} ORDER BY l.id DESC LIMIT ${limit} OFFSET ${offset}`,
-      w.params,
-    );
-    const total = rows[0]?.total_count || 0;
-    res.json({ items: rows, page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) });
+    const [rows, total] = await Promise.all([
+      col('whatsapp_notification_logs').find(filter, { projection: { _id: 0 } }).sort({ id: -1 }).skip(offset).limit(limit).toArray(),
+      col('whatsapp_notification_logs').countDocuments(filter),
+    ]);
+    const enquiries = await mapById('customer_enquiries', rows.map((r) => r.enquiry_id), { name: 1 });
+    const items = rows.map((l) => ({ ...l, customer_name: enquiries.get(l.enquiry_id)?.name ?? null }));
+    res.json({ items, page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) });
   }),
 );
 

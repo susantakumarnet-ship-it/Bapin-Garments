@@ -1,19 +1,16 @@
-# Production-like stack: PostgreSQL + Bapin Garments app.
+# Production-like stack: MongoDB + Bapin Garments app.
 #   1. cp server/.env.example .env  and set JWT_SECRET, ENCRYPTION_KEY, etc.
 #   2. docker compose up -d --build
 #   3. open http://localhost:4000
+# To use MongoDB Atlas instead, remove the `db` service and set MONGODB_URI in .env.
 services:
   db:
-    image: postgres:16-alpine
+    image: mongo:7
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: bapin
-      POSTGRES_USER: bapin
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mongodata:/data/db
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U bapin']
+      test: ['CMD', 'mongosh', '--quiet', '--eval', 'db.adminCommand("ping")']
       interval: 5s
       retries: 10
 
@@ -23,7 +20,8 @@ services:
     env_file: .env
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgres://bapin:${POSTGRES_PASSWORD:-change-this-password}@db:5432/bapin
+      MONGODB_URI: mongodb://db:27017
+      MONGODB_DB: BapinGarments
       PUBLIC_SITE_URL: ${PUBLIC_SITE_URL:-http://localhost:4000}
       CORS_ORIGINS: ${PUBLIC_SITE_URL:-http://localhost:4000}
     ports:
@@ -35,5 +33,5 @@ services:
         condition: service_healthy
 
 volumes:
-  pgdata:
+  mongodata:
   uploads:

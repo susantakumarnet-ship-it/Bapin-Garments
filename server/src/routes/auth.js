@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { one, query } from '../db/index.js';
+import { col, NO_ID, exactRegex } from '../db/index.js';
 import { ah, validate, HttpError } from '../utils/helpers.js';
 import { AUTH_COOKIE, cookieOptions, permissionsFor, requireAuth, signToken } from '../middleware/auth.js';
 import { loginLimiter, passwordResetLimiter } from '../middleware/security.js';
@@ -30,6 +30,8 @@ const publicUser = (u) => ({
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 12);
 const MAX_FAILED = 5;
 const LOCK_MINUTES = 15;
+const users = () => col('admin_users');
+const ci = exactRegex;
 
 router.post(
   '/login',
@@ -39,7 +41,7 @@ router.post(
       z.object({ identifier: z.string().trim().min(1, 'Enter username or email').max(160), password: z.string().min(1).max(128) }),
       req.body,
     );
-    const user = await one('SELECT * FROM admin_users WHERE LOWER(username) = LOWER($1) OR LOWER(email) = LOWER($1)', [identifier]);
+    const user = await users().findOne({ $or: [{ username: ci(identifier) }, { email: ci(identifier) }] }, NO_ID);
     const genericError = new HttpError(401, 'Invalid username/email or password');
 
     if (!user) {
@@ -53,16 +55,14 @@ router.post(
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) {
       const failed = user.failed_logins + 1;
-      await query(
-        `UPDATE admin_users
-           SET failed_logins = CASE WHEN $2::int >= ${MAX_FAILED} THEN 0 ELSE $2::int END,
-               locked_until = CASE WHEN $2::int >= ${MAX_FAILED} THEN NOW() + INTERVAL '${LOCK_MINUTES} minutes' ELSE NULL END
-         WHERE id = $1`,
-        [user.id, failed],
+      const lock = failed >= MAX_FAILED;
+      await users().updateOne(
+        { id: user.id },
+        { $set: { failed_logins: lock ? 0 : failed, locked_until: lock ? new Date(Date.now() + LOCK_MINUTES * 60000) : null } },
       );
       throw genericError;
     }
-    await query('UPDATE admin_users SET failed_logins = 0, locked_until = NULL, last_login_at = NOW() WHERE id = $1', [user.id]);
+    await users().updateOne({ id: user.id }, { $set: { failed_logins: 0, locked_until: null, last_login_at: new Date() } });
     res.cookie(AUTH_COOKIE, signToken(user), cookieOptions());
     res.json({ user: publicUser(user) });
   }),
@@ -84,12 +84,12 @@ router.post(
   passwordResetLimiter,
   ah(async (req, res) => {
     const { email } = validate(z.object({ email: z.string().trim().email('Enter a valid email') }), req.body);
-    const user = await one('SELECT id, name, email, is_active FROM admin_users WHERE LOWER(email) = LOWER($1)', [email]);
+    const user = await users().findOne({ email: ci(email) }, NO_ID);
     if (user && user.is_active) {
       const token = randomToken(32);
-      await query(
-        `UPDATE admin_users SET reset_token_hash = $2, reset_token_expires = NOW() + INTERVAL '30 minutes' WHERE id = $1`,
-        [user.id, sha256(token)],
+      await users().updateOne(
+        { id: user.id },
+        { $set: { reset_token_hash: sha256(token), reset_token_expires: new Date(Date.now() + 30 * 60000) } },
       );
       const link = `${config.publicSiteUrl}/admin/reset-password?token=${token}`;
       await sendMail({
@@ -108,16 +108,21 @@ router.post(
   passwordResetLimiter,
   ah(async (req, res) => {
     const { token, password } = validate(z.object({ token: z.string().min(20).max(200), password: passwordSchema }), req.body);
-    const user = await one(
-      'SELECT id FROM admin_users WHERE reset_token_hash = $1 AND reset_token_expires > NOW() AND is_active',
-      [sha256(token)],
-    );
+    const user = await users().findOne({ reset_token_hash: sha256(token), reset_token_expires: { $gt: new Date() }, is_active: true });
     if (!user) throw new HttpError(400, 'This reset link is invalid or has expired');
     const hash = await bcrypt.hash(password, 12);
-    await query(
-      `UPDATE admin_users SET password_hash = $2, reset_token_hash = NULL, reset_token_expires = NULL,
-         failed_logins = 0, locked_until = NULL, updated_at = NOW() WHERE id = $1`,
-      [user.id, hash],
+    await users().updateOne(
+      { id: user.id },
+      {
+        $set: {
+          password_hash: hash,
+          reset_token_hash: null,
+          reset_token_expires: null,
+          failed_logins: 0,
+          locked_until: null,
+          updated_at: new Date(),
+        },
+      },
     );
     res.json({ ok: true, message: 'Password updated. You can now log in.' });
   }),
@@ -131,10 +136,14 @@ router.post(
       z.object({ current_password: z.string().min(1), new_password: passwordSchema }),
       req.body,
     );
-    const user = await one('SELECT * FROM admin_users WHERE id = $1', [req.user.id]);
+    const user = await users().findOne({ id: req.user.id }, NO_ID);
     if (!(await bcrypt.compare(current_password, user.password_hash))) throw new HttpError(400, 'Current password is incorrect');
     const hash = await bcrypt.hash(new_password, 12);
-    const updated = await one('UPDATE admin_users SET password_hash = $2, updated_at = NOW() WHERE id = $1 RETURNING *', [user.id, hash]);
+    const updated = await users().findOneAndUpdate(
+      { id: user.id },
+      { $set: { password_hash: hash, updated_at: new Date() } },
+      { returnDocument: 'after', ...NO_ID },
+    );
     res.cookie(AUTH_COOKIE, signToken(updated), cookieOptions());
     res.json({ ok: true, message: 'Password changed successfully' });
   }),

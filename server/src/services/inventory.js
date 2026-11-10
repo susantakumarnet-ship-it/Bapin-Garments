@@ -1,3 +1,14 @@
+import { col, insert } from '../db/index.js';
+
+/** Make sure a variant has an inventory document (with a numeric id). */
+async function ensureInventory(variantId, now) {
+  if (await col('inventory').findOne({ variant_id: variantId })) return;
+  try {
+    await insert('inventory', { variant_id: variantId, quantity: 0, updated_at: now });
+  } catch (err) {
+    if (err?.code !== 11000) throw err; // created concurrently
+  }
+}
 import { HttpError } from '../utils/helpers.js';
 
 /**
@@ -18,70 +29,94 @@ export const STATUS_LABEL = {
   out_of_stock: 'Out of Stock',
 };
 
-/**
- * SQL fragment computing product total stock & effective threshold.
- * Use with `$X` = global threshold param.
- */
-export const productStockCte = (thresholdParam) => `
-  WITH stock AS (
-    SELECT p.id AS product_id,
-           COALESCE(SUM(i.quantity), 0)::int AS total_stock,
-           COALESCE(p.low_stock_threshold, ${thresholdParam})::int AS threshold
-    FROM products p
-    LEFT JOIN product_variants v ON v.product_id = p.id AND v.is_active
-    LEFT JOIN inventory i ON i.variant_id = v.id
-    GROUP BY p.id
-  )`;
-
-export const stockStatusSql = (qtyExpr, thrExpr) =>
-  `CASE WHEN ${qtyExpr} <= 0 THEN 'out_of_stock' WHEN ${qtyExpr} <= ${thrExpr} THEN 'low_stock' ELSE 'in_stock' END`;
-
-/**
- * Apply a stock movement to a variant inside a transaction.
- * type: IN (add), OUT (remove), ADJUST (set absolute quantity).
- */
-export async function applyStockMovement(tx, { variantId, type, quantity, reason, reference, adminUserId }) {
+function checkQuantity(type, quantity) {
   const qty = Number(quantity);
   if (!Number.isInteger(qty) || qty < 0) throw new HttpError(400, 'Quantity must be a whole number ≥ 0');
   if (type !== 'ADJUST' && qty === 0) throw new HttpError(400, 'Quantity must be greater than zero');
+  if (!['IN', 'OUT', 'ADJUST'].includes(type)) throw new HttpError(400, 'Invalid transaction type');
+  return qty;
+}
 
-  const { rows } = await tx.query(
-    `SELECT v.id, v.product_id, v.size, v.color, COALESCE(i.quantity, 0)::int AS quantity
-     FROM product_variants v LEFT JOIN inventory i ON i.variant_id = v.id
-     WHERE v.id = $1 FOR UPDATE OF v`,
-    [variantId],
-  );
-  const v = rows[0];
+/**
+ * Check a batch of movements before applying any of them, so a bad line
+ * (e.g. removing more than is in stock) rejects the whole batch.
+ */
+export async function validateMovements(movements) {
+  const ids = [...new Set(movements.map((m) => m.variantId))];
+  const [variants, stock] = await Promise.all([
+    col('product_variants').find({ id: { $in: ids } }).toArray(),
+    col('inventory').find({ variant_id: { $in: ids } }).toArray(),
+  ]);
+  const byId = new Map(variants.map((v) => [v.id, v]));
+  const qty = new Map(stock.map((s) => [s.variant_id, s.quantity]));
+  for (const m of movements) {
+    const n = checkQuantity(m.type, m.quantity);
+    const v = byId.get(m.variantId);
+    if (!v) throw new HttpError(404, 'Variant not found');
+    const cur = qty.get(v.id) ?? 0;
+    if (m.type === 'OUT' && n > cur) throw new HttpError(400, `Cannot remove ${n}; only ${cur} in stock for ${v.size}/${v.color}`);
+    qty.set(v.id, m.type === 'IN' ? cur + n : m.type === 'OUT' ? cur - n : n);
+  }
+}
+
+/**
+ * Apply a stock movement to a variant and record it in stock_transactions.
+ * type: IN (add), OUT (remove), ADJUST (set absolute quantity).
+ * Updates are atomic per variant (OUT can never take stock below zero).
+ */
+export async function applyStockMovement({ variantId, type, quantity, reason, reference, adminUserId, at }) {
+  const qty = checkQuantity(type, quantity);
+  const v = await col('product_variants').findOne({ id: variantId });
   if (!v) throw new HttpError(404, 'Variant not found');
+  const now = at || new Date();
+  await ensureInventory(variantId, now);
 
   let newQty;
   let delta;
   if (type === 'IN') {
-    newQty = v.quantity + qty;
+    const r = await col('inventory').findOneAndUpdate(
+      { variant_id: variantId },
+      { $inc: { quantity: qty }, $set: { updated_at: now } },
+      { returnDocument: 'after' },
+    );
+    newQty = r.quantity;
     delta = qty;
   } else if (type === 'OUT') {
-    if (qty > v.quantity) throw new HttpError(400, `Cannot remove ${qty}; only ${v.quantity} in stock for ${v.size}/${v.color}`);
-    newQty = v.quantity - qty;
+    const r = await col('inventory').findOneAndUpdate(
+      { variant_id: variantId, quantity: { $gte: qty } },
+      { $inc: { quantity: -qty }, $set: { updated_at: now } },
+      { returnDocument: 'after' },
+    );
+    if (!r) {
+      const cur = (await col('inventory').findOne({ variant_id: variantId }))?.quantity ?? 0;
+      throw new HttpError(400, `Cannot remove ${qty}; only ${cur} in stock for ${v.size}/${v.color}`);
+    }
+    newQty = r.quantity;
     delta = qty;
-  } else if (type === 'ADJUST') {
-    newQty = qty;
-    delta = qty - v.quantity;
-    if (delta === 0) return { variantId, quantity: newQty, unchanged: true };
   } else {
-    throw new HttpError(400, 'Invalid transaction type');
+    const before = await col('inventory').findOneAndUpdate(
+      { variant_id: variantId },
+      { $set: { quantity: qty, updated_at: now } },
+      { returnDocument: 'before' },
+    );
+    const prev = before?.quantity ?? 0;
+    newQty = qty;
+    delta = qty - prev;
+    if (delta === 0) return { variantId, quantity: newQty, unchanged: true };
   }
 
-  await tx.query(
-    `INSERT INTO inventory (variant_id, quantity, updated_at) VALUES ($1, $2, NOW())
-     ON CONFLICT (variant_id) DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()`,
-    [variantId, newQty],
-  );
-  await tx.query(
-    `INSERT INTO stock_transactions
-       (product_id, variant_id, variant_label, type, quantity, balance_after, reason, reference, admin_user_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [v.product_id, variantId, `${v.size} / ${v.color}`, type, delta, newQty, reason || null, reference || null, adminUserId || null],
-  );
-  await tx.query('UPDATE products SET updated_at = NOW() WHERE id = $1', [v.product_id]);
+  await insert('stock_transactions', {
+    product_id: v.product_id,
+    variant_id: variantId,
+    variant_label: `${v.size} / ${v.color}`,
+    type,
+    quantity: delta,
+    balance_after: newQty,
+    reason: reason || null,
+    reference: reference || null,
+    admin_user_id: adminUserId || null,
+    created_at: now,
+  });
+  await col('products').updateOne({ id: v.product_id }, { $set: { updated_at: now } });
   return { variantId, quantity: newQty };
 }

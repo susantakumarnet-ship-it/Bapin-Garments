@@ -9,14 +9,14 @@
 | Session invalidation | Changing a password, role or active status invalidates that user's existing sessions. |
 | Role-based access | `super_admin`, `admin` and `staff` permissions are enforced **on the server** for every admin route (`middleware/auth.js`). The UI also hides actions the user can't perform. |
 | Backend validation | Every request body is validated with `zod` schemas (types, lengths, formats, price rules). |
-| SQL injection | Every query is parameterised (`$1, $2 …`). No user input is concatenated into SQL. |
+| NoSQL injection | User input only ever reaches MongoDB as typed values inside query objects (validated by `zod` first). It is never evaluated as an operator or code, and search terms are regex-escaped. |
 | XSS | React escapes all output. Helmet sets a strict Content-Security-Policy, `X-Content-Type-Options` and `Referrer-Policy`. Uploaded files are served with `nosniff`. |
 | CSRF | SameSite=Strict cookie, and every state-changing request must carry `X-Requested-With`. CORS only allows configured origins. |
 | API security | Helmet headers, a JSON body size limit (200 KB), a generic rate limit (600 requests per 15 min), error messages hidden in production, `x-powered-by` disabled. |
 | Rate limiting | Global API limit, plus stricter limits on login, password reset and enquiry submission (5 per 10 min). The enquiry form also has a honeypot field. |
 | Secure image uploads | MIME allow-list **plus magic-byte check** (JPG/PNG/WEBP/GIF), 5 MB limit, at most 10 files per request, random file names, path-traversal-safe deletion, optional Cloudinary storage. |
-| Credentials | All secrets come from environment variables. If `JWT_SECRET` / `ENCRYPTION_KEY` are not set in production, the server generates strong random values once and stores them in the database (`app_secrets` table), never in code. WhatsApp tokens saved from the admin panel are encrypted with **AES-256-GCM** and never returned to the browser (only a masked hint). |
-| Database backups | `npm run backup` (pg_dump, keeps 30 copies). Managed-Postgres backups are recommended. See DEPLOYMENT.md. |
+| Credentials | All secrets come from environment variables. If `JWT_SECRET` / `ENCRYPTION_KEY` are not set in production, the server generates strong random values once and stores them in the database (`app_secrets` collection), never in code. WhatsApp tokens saved from the admin panel are encrypted with **AES-256-GCM** and never returned to the browser (only a masked hint). |
+| Database backups | `npm run backup` (JSON export, keeps 30 copies) and `npm run restore`. Atlas Cloud Backup is recommended on paid clusters. See DEPLOYMENT.md. |
 | Customer data protection | Customer data is reachable only through authenticated admin routes. Enquiry consent is recorded. Public product APIs leave out internal fields such as view counts and thresholds. |
 
 ## Operational recommendations

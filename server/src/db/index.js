@@ -1,93 +1,135 @@
 /**
- * Database access layer.
+ * Database access layer: MongoDB (official driver).
  *
- * - Production: real PostgreSQL via `pg` (set DATABASE_URL).
- * - Local development: embedded PostgreSQL (PGlite, WebAssembly) persisted to
- *   ./data/pglite, so the project runs with zero database setup.
+ * Set MONGODB_URI (or DATABASE_URL) to a MongoDB connection string, e.g. a
+ * free MongoDB Atlas cluster. Each former SQL table is a collection with the
+ * same field names. Every document also carries a numeric `id` (from the
+ * `counters` collection), so URLs and API responses keep simple numeric IDs.
  *
- * Both drivers speak the same SQL dialect and use `$1, $2 ...` parameter
- * placeholders. All queries in this codebase are parameterised (no string
- * concatenation of user input) which protects against SQL injection.
+ * User input is only ever passed as values inside query objects, never
+ * evaluated, and search terms are regex-escaped (see `likeRegex`).
  */
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { MongoClient } from 'mongodb';
 import { config } from '../config.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+let client = null;
+let db = null;
 
-let driver = null; // { query(text, params), transaction(fn), close(), kind }
+export const COLLECTIONS = [
+  'admin_users',
+  'customers',
+  'product_categories',
+  'products',
+  'product_images',
+  'product_variants',
+  'inventory',
+  'stock_transactions',
+  'customer_enquiries',
+  'whatsapp_notification_logs',
+  'website_settings',
+];
 
-const NUMERIC_OID = 1700;
-const INT8_OID = 20;
+const INDEXES = {
+  admin_users: [[{ username: 1 }, { unique: true }], [{ email: 1 }, { unique: true }]],
+  customers: [[{ mobile: 1 }, { unique: true }]],
+  product_categories: [[{ slug: 1 }, { unique: true }], [{ parent_id: 1 }]],
+  products: [[{ slug: 1 }, { unique: true }], [{ sku: 1 }, { unique: true }], [{ category_id: 1 }], [{ created_at: -1 }]],
+  product_images: [[{ product_id: 1 }]],
+  product_variants: [[{ sku: 1 }, { unique: true }], [{ product_id: 1, size: 1, color: 1 }, { unique: true }]],
+  inventory: [[{ variant_id: 1 }, { unique: true }]],
+  stock_transactions: [[{ product_id: 1 }], [{ created_at: -1 }]],
+  customer_enquiries: [[{ created_at: -1 }], [{ status: 1 }], [{ mobile: 1 }]],
+  whatsapp_notification_logs: [[{ enquiry_id: 1 }]],
+  website_settings: [[{ key: 1 }, { unique: true }]],
+};
 
-async function createPg() {
-  const pg = (await import('pg')).default;
-  pg.types.setTypeParser(NUMERIC_OID, (v) => (v === null ? null : parseFloat(v)));
-  pg.types.setTypeParser(INT8_OID, (v) => (v === null ? null : parseInt(v, 10)));
-  const pool = new pg.Pool({
-    connectionString: config.databaseUrl,
-    ssl: config.databaseSsl ? { rejectUnauthorized: false } : undefined,
-    max: 10,
-  });
-  return {
-    kind: 'postgres',
-    query: (text, params) => pool.query(text, params),
-    exec: (sql) => pool.query(sql),
-    async transaction(fn) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        const result = await fn({ query: (t, p) => client.query(t, p) });
-        await client.query('COMMIT');
-        return result;
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
-      }
-    },
-    close: () => pool.end(),
-  };
+/** Collection accessor: col('products').find(...) */
+export const col = (name) => {
+  if (!db) throw new Error('Database not initialised');
+  return db.collection(name);
+};
+
+/** Next numeric id for a collection (atomic counter). */
+export async function nextId(name) {
+  const r = await col('counters').findOneAndUpdate({ _id: name }, { $inc: { seq: 1 } }, { upsert: true, returnDocument: 'after' });
+  return r.seq;
 }
 
-async function createPglite() {
-  const { PGlite } = await import('@electric-sql/pglite');
-  fs.mkdirSync(config.pgliteDir, { recursive: true });
-  const db = new PGlite(config.pgliteDir, {
-    parsers: {
-      [NUMERIC_OID]: (v) => (v === null ? null : parseFloat(v)),
-      [INT8_OID]: (v) => (v === null ? null : parseInt(v, 10)),
-    },
-  });
-  await db.waitReady;
-  // PGlite is single-connection: serialise access so transactions never interleave.
-  let chain = Promise.resolve();
-  const serial = (fn) => {
-    const run = chain.then(fn, fn);
-    chain = run.catch(() => {});
-    return run;
-  };
-  return {
-    kind: 'pglite',
-    query: (text, params) => serial(() => db.query(text, params)),
-    exec: (sql) => serial(() => db.exec(sql)),
-    transaction: (fn) =>
-      serial(() => db.transaction((tx) => fn({ query: (t, p) => tx.query(t, p) }))),
-    close: () => db.close(),
-  };
+/** Insert a document, assigning a numeric id. Returns the stored document without _id. */
+export async function insert(name, doc) {
+  const full = { id: await nextId(name), ...doc };
+  await col(name).insertOne(full);
+  delete full._id;
+  return full;
+}
+
+/** Projection that hides Mongo's internal _id. */
+export const NO_ID = { projection: { _id: 0 } };
+
+const escapeRegex = (v) => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Case-insensitive "contains" regex with user input safely escaped. */
+export const likeRegex = (term) => new RegExp(escapeRegex(String(term).trim().slice(0, 80)), 'i');
+
+/** Case-insensitive exact-match regex (like LOWER(a) = LOWER(b)). */
+export const exactRegex = (value) => new RegExp(`^${escapeRegex(value)}$`, 'i');
+
+/** Start of the given YYYY-MM-DD day (UTC); `end` gives the start of the next day. */
+export function dayBound(value, end = false) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const d = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) return null;
+  if (end) d.setUTCDate(d.getUTCDate() + 1);
+  return d;
+}
+
+/** Mongo filter for created_at between ?from and ?to (inclusive days). */
+export function dateRange(from, to) {
+  const range = {};
+  const f = dayBound(from);
+  const t = dayBound(to, true);
+  if (f) range.$gte = f;
+  if (t) range.$lt = t;
+  return Object.keys(range).length ? range : null;
+}
+
+function resolveUri() {
+  const uri = config.mongoUri;
+  if (!uri) {
+    throw new Error('MONGODB_URI is not set. Add your MongoDB connection string to server/.env (see .env.example).');
+  }
+  if (!/^mongodb(\+srv)?:\/\//.test(uri)) {
+    throw new Error('MONGODB_URI must start with mongodb:// or mongodb+srv://');
+  }
+  return uri;
 }
 
 export async function initDb() {
-  if (driver) return driver;
-  driver = config.databaseUrl ? await createPg() : await createPglite();
-  const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
-  await driver.exec(schema);
+  if (db) return db;
+  client = new MongoClient(resolveUri(), { serverSelectionTimeoutMS: 15000, appName: 'bapin-garments' });
+  try {
+    await client.connect();
+  } catch (err) {
+    const hint = /bad auth|authentication failed/i.test(err.message)
+      ? ' (check the username/password; special characters such as @ : / must be URL-encoded, e.g. @ -> %40)'
+      : /ENOTFOUND|querySrv|ETIMEOUT|timed out|Server selection/i.test(err.message)
+        ? ' (check the cluster address and that Atlas "Network Access" allows this server\'s IP, or 0.0.0.0/0)'
+        : '';
+    throw new Error(`Could not connect to MongoDB: ${err.message}${hint}`);
+  }
+  db = client.db(config.mongoDbName || undefined);
+  // Settings are keyed by `key`; drop a numeric-id index left by an early build.
+  await col('website_settings').dropIndex('id_1').catch(() => {});
+  await Promise.all(
+    [...Object.entries(INDEXES)].flatMap(([name, list]) => [
+      ...(name === 'website_settings' ? [] : [col(name).createIndex({ id: 1 }, { unique: true })]),
+      ...list.map(([keys, opts]) => col(name).createIndex(keys, opts || {})),
+    ]),
+  );
   await ensureSecrets();
-  console.log(`[db] connected (${driver.kind === 'postgres' ? 'PostgreSQL' : `embedded PGlite at ${config.pgliteDir}`})`);
-  return driver;
+  console.log(`[db] connected to MongoDB database "${db.databaseName}"`);
+  return db;
 }
 
 /**
@@ -101,37 +143,20 @@ async function ensureSecrets() {
     ['encryption_key', 'encryptionKey'],
   ].filter(([, prop]) => !config[prop]);
   for (const [name, prop] of wanted) {
-    await driver.query('INSERT INTO app_secrets (name, value) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING', [
-      name,
-      crypto.randomBytes(48).toString('hex'),
-    ]);
-    const { rows } = await driver.query('SELECT value FROM app_secrets WHERE name = $1', [name]);
-    config[prop] = rows[0].value;
+    await col('app_secrets').updateOne(
+      { _id: name },
+      { $setOnInsert: { value: crypto.randomBytes(48).toString('hex'), created_at: new Date() } },
+      { upsert: true },
+    );
+    const doc = await col('app_secrets').findOne({ _id: name });
+    config[prop] = doc.value;
     console.log(`[db] ${name} not set in environment - using the value stored in the database`);
   }
-  if (config.isProd && driver.kind === 'pglite') {
-    console.warn('[db] WARNING: DATABASE_URL is not set - using an embedded database inside the container.');
-    console.warn('[db]          On hosts like Render this is wiped on every deploy. Attach PostgreSQL for real data.');
-  }
-}
-
-/** Run a parameterised query. Returns the array of rows. */
-export async function query(text, params = []) {
-  const res = await driver.query(text, params);
-  return res.rows;
-}
-
-/** Return the first row or null. */
-export async function one(text, params = []) {
-  const rows = await query(text, params);
-  return rows[0] || null;
-}
-
-/** Run `fn(tx)` inside a transaction; `tx.query` returns { rows }. */
-export function transaction(fn) {
-  return driver.transaction(fn);
 }
 
 export function closeDb() {
-  return driver?.close();
+  const c = client;
+  client = null;
+  db = null;
+  return c?.close();
 }

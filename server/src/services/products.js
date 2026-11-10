@@ -1,7 +1,8 @@
-import { query, one } from '../db/index.js';
+import { col, NO_ID, dayBound, likeRegex } from '../db/index.js';
 import { getLowStockThreshold } from './settings.js';
-import { productStockCte, stockStatus, stockStatusSql } from './inventory.js';
-import { Where, pageParams, toInt } from '../utils/helpers.js';
+import { stockStatus } from './inventory.js';
+import { categoryTree, loadCatalog, paginate } from './catalog.js';
+import { pageParams, toInt } from '../utils/helpers.js';
 
 export const SIZE_ORDER = ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', 'Free Size'];
 export const sizeRank = (s) => {
@@ -55,148 +56,129 @@ function shapeListRow(r) {
   };
 }
 
+const byId = (a, b) => a.id - b.id;
+const time = (d) => new Date(d).getTime();
+const discountRatio = (p) => (p.original_price ? (p.original_price - p.price) / p.original_price : -1);
+
 const SORTS = {
-  newest: 'p.created_at DESC, p.id DESC',
-  oldest: 'p.created_at ASC, p.id ASC',
-  price_asc: 'COALESCE(p.discount_price, p.original_price) ASC, p.id',
-  price_desc: 'COALESCE(p.discount_price, p.original_price) DESC, p.id',
-  popular: 'p.view_count DESC, p.id DESC',
-  discount: '(p.original_price - COALESCE(p.discount_price, p.original_price)) / NULLIF(p.original_price,0) DESC NULLS LAST, p.id',
-  name: 'p.name ASC',
-  stock_asc: 's.total_stock ASC, p.id',
-  stock_desc: 's.total_stock DESC, p.id',
-  enquiries: 'p.enquiry_count DESC, p.id DESC',
+  newest: (a, b) => time(b.created_at) - time(a.created_at) || b.id - a.id,
+  oldest: (a, b) => time(a.created_at) - time(b.created_at) || byId(a, b),
+  price_asc: (a, b) => a.price - b.price || byId(a, b),
+  price_desc: (a, b) => b.price - a.price || byId(a, b),
+  popular: (a, b) => b.view_count - a.view_count || b.id - a.id,
+  discount: (a, b) => discountRatio(b) - discountRatio(a) || byId(a, b),
+  name: (a, b) => a.name.localeCompare(b.name),
+  stock_asc: (a, b) => a.total_stock - b.total_stock || byId(a, b),
+  stock_desc: (a, b) => b.total_stock - a.total_stock || byId(a, b),
+  enquiries: (a, b) => b.enquiry_count - a.enquiry_count || b.id - a.id,
 };
+
+/** Flatten an enriched catalogue product into the list-row shape used by the UI. */
+function toListRow(p) {
+  const active = p.variants.filter((v) => v.is_active);
+  const colors = [];
+  const seen = new Set();
+  for (const v of active) {
+    if (!seen.has(v.color)) {
+      seen.add(v.color);
+      colors.push({ name: v.color, hex: v.color_hex });
+    }
+  }
+  return shapeListRow({
+    ...p,
+    category_name: p.category?.name,
+    category_slug: p.category?.slug,
+    parent_category_name: p.parent?.name ?? null,
+    image: p.images[0]?.url ?? null,
+    image2: p.images[1]?.url ?? null,
+    sizes: [...new Set(active.map((v) => v.size))],
+    colors,
+  });
+}
 
 /**
  * Flexible product listing used by both the storefront and admin.
  * opts.publicOnly restricts to active products in active categories.
  */
 export async function listProducts(q = {}, opts = {}) {
-  const threshold = await getLowStockThreshold();
-  const w = new Where();
-  w.params.push(threshold); // $1 used by the stock CTE
+  const filter = {};
+  if (opts.publicOnly || q.active === 'true') filter.is_active = true;
+  if (q.active === 'false' && !opts.publicOnly) filter.is_active = false;
+  const { categories, products } = await loadCatalog(filter);
 
-  if (opts.publicOnly) w.add('p.is_active = TRUE').add('c.is_active = TRUE');
-  if (q.active === 'true') w.add('p.is_active = TRUE');
-  if (q.active === 'false') w.add('p.is_active = FALSE');
-
+  const tests = [];
+  if (opts.publicOnly) tests.push((p) => p.category?.is_active);
   if (q.category) {
-    w.add(
-      `p.category_id IN (
-        WITH RECURSIVE tree AS (
-          SELECT id FROM product_categories WHERE slug = ?
-          UNION ALL SELECT pc.id FROM product_categories pc JOIN tree t ON pc.parent_id = t.id
-        ) SELECT id FROM tree)`,
-      String(q.category),
-    );
+    const ids = categoryTree(categories, (c) => c.slug === String(q.category));
+    tests.push((p) => ids.has(p.category_id));
   }
   if (toInt(q.category_id)) {
-    w.add(
-      `p.category_id IN (
-        WITH RECURSIVE tree AS (
-          SELECT id FROM product_categories WHERE id = ?
-          UNION ALL SELECT pc.id FROM product_categories pc JOIN tree t ON pc.parent_id = t.id
-        ) SELECT id FROM tree)`,
-      toInt(q.category_id),
-    );
+    const ids = categoryTree(categories, (c) => c.id === toInt(q.category_id));
+    tests.push((p) => ids.has(p.category_id));
   }
   if (q.q) {
-    const term = `%${String(q.q).trim().slice(0, 80)}%`;
-    w.add(
-      '(p.name ILIKE ? OR p.sku ILIKE ? OR c.name ILIKE ? OR pc.name ILIKE ? OR p.fabric ILIKE ? OR p.description ILIKE ?)',
-      term, term, term, term, term, term,
-    );
+    const re = likeRegex(q.q);
+    tests.push((p) => [p.name, p.sku, p.category?.name, p.parent?.name, p.fabric, p.description].some((v) => v && re.test(v)));
   }
-  if (q.size) w.add('EXISTS (SELECT 1 FROM product_variants v WHERE v.product_id = p.id AND v.is_active AND v.size = ?)', String(q.size));
-  if (q.color) w.add('EXISTS (SELECT 1 FROM product_variants v WHERE v.product_id = p.id AND v.is_active AND LOWER(v.color) = LOWER(?))', String(q.color));
-  if (q.min_price) w.add('COALESCE(p.discount_price, p.original_price) >= ?', Number(q.min_price));
-  if (q.max_price) w.add('COALESCE(p.discount_price, p.original_price) <= ?', Number(q.max_price));
-  if (q.in_stock === 'true') w.add('s.total_stock > 0');
-  if (q.stock_status && ['in_stock', 'low_stock', 'out_of_stock'].includes(q.stock_status)) {
-    w.add(`${stockStatusSql('s.total_stock', 's.threshold')} = ?`, q.stock_status);
+  if (q.size) tests.push((p) => p.variants.some((v) => v.is_active && v.size === String(q.size)));
+  if (q.color) {
+    const c = String(q.color).toLowerCase();
+    tests.push((p) => p.variants.some((v) => v.is_active && v.color.toLowerCase() === c));
   }
-  switch (q.tag) {
-    case 'new':
-      w.add(`(p.is_new_arrival OR p.created_at > NOW() - INTERVAL '30 days')`);
-      break;
-    case 'featured':
-      w.add('p.is_featured');
-      break;
-    case 'bestseller':
-      w.add('p.is_best_seller');
-      break;
-    case 'trending':
-      w.add('p.is_trending');
-      break;
-    case 'offers':
-      w.add('p.discount_price IS NOT NULL AND p.discount_price < p.original_price');
-      break;
-    default:
-  }
-  if (q.exclude_id) w.add('p.id <> ?', toInt(q.exclude_id));
-  if (q.from) w.add('p.created_at >= ?', q.from);
-  if (q.to) w.add(`p.created_at < (?::date + INTERVAL '1 day')`, q.to);
-
-  const { page, limit, offset } = pageParams(q, opts.defaultLimit || 24, opts.maxLimit || 100);
-  const order = SORTS[q.sort] || SORTS.newest;
-
-  const sql = `
-    ${productStockCte('$1')}
-    SELECT p.*, c.name AS category_name, c.slug AS category_slug, pc.name AS parent_category_name,
-           s.total_stock, s.threshold,
-           ${stockStatusSql('s.total_stock', 's.threshold')} AS stock_status,
-           (SELECT url FROM product_images i WHERE i.product_id = p.id ORDER BY i.is_primary DESC, i.sort_order, i.id LIMIT 1) AS image,
-           (SELECT url FROM product_images i WHERE i.product_id = p.id ORDER BY i.is_primary DESC, i.sort_order, i.id OFFSET 1 LIMIT 1) AS image2,
-           (SELECT COALESCE(json_agg(DISTINCT v.size), '[]'::json) FROM product_variants v WHERE v.product_id = p.id AND v.is_active) AS sizes,
-           (SELECT COALESCE(json_agg(DISTINCT jsonb_build_object('name', v.color, 'hex', v.color_hex)), '[]'::json)
-              FROM product_variants v WHERE v.product_id = p.id AND v.is_active) AS colors,
-           COUNT(*) OVER()::int AS total_count
-    FROM products p
-    JOIN product_categories c ON c.id = p.category_id
-    LEFT JOIN product_categories pc ON pc.id = c.parent_id
-    JOIN stock s ON s.product_id = p.id
-    ${w.sql}
-    ORDER BY ${order}
-    LIMIT ${limit} OFFSET ${offset}`;
-
-  const rows = await query(sql, w.params);
-  const total = rows[0]?.total_count || 0;
-  return {
-    items: rows.map(shapeListRow),
-    page,
-    limit,
-    total,
-    pages: Math.max(1, Math.ceil(total / limit)),
+  if (q.min_price) tests.push((p) => p.price >= Number(q.min_price));
+  if (q.max_price) tests.push((p) => p.price <= Number(q.max_price));
+  if (q.in_stock === 'true') tests.push((p) => p.total_stock > 0);
+  if (['in_stock', 'low_stock', 'out_of_stock'].includes(q.stock_status)) tests.push((p) => p.stock_status === q.stock_status);
+  const monthAgo = Date.now() - 30 * 86400000;
+  const TAGS = {
+    new: (p) => p.is_new_arrival || time(p.created_at) > monthAgo,
+    featured: (p) => p.is_featured,
+    bestseller: (p) => p.is_best_seller,
+    trending: (p) => p.is_trending,
+    offers: (p) => p.discount_price != null && p.discount_price < p.original_price,
   };
+  if (TAGS[q.tag]) tests.push(TAGS[q.tag]);
+  if (q.exclude_id) tests.push((p) => p.id !== toInt(q.exclude_id));
+  const from = dayBound(q.from);
+  const to = dayBound(q.to, true);
+  if (from) tests.push((p) => new Date(p.created_at) >= from);
+  if (to) tests.push((p) => new Date(p.created_at) < to);
+
+  const rows = products.filter((p) => tests.every((t) => t(p))).sort(SORTS[q.sort] || SORTS.newest);
+  const pg = pageParams(q, opts.defaultLimit || 24, opts.maxLimit || 100);
+  const page = paginate(rows, pg);
+  return { ...page, items: page.items.map(toListRow) };
 }
 
 /** Full product with images, variants and per-variant stock. */
 export async function getProduct({ id, slug }, opts = {}) {
   const threshold = await getLowStockThreshold();
-  const p = await one(
-    `SELECT p.*, c.name AS category_name, c.slug AS category_slug, c.is_active AS category_active,
-            pc.name AS parent_category_name, pc.slug AS parent_category_slug
-     FROM products p
-     JOIN product_categories c ON c.id = p.category_id
-     LEFT JOIN product_categories pc ON pc.id = c.parent_id
-     WHERE ${id ? 'p.id = $1' : 'p.slug = $1'}`,
-    [id ?? slug],
-  );
+  const p = await col('products').findOne(id ? { id } : { slug: String(slug) }, NO_ID);
   if (!p) return null;
-  if (opts.publicOnly && (!p.is_active || !p.category_active)) return null;
+  const c = await col('product_categories').findOne({ id: p.category_id }, NO_ID);
+  const pc = c?.parent_id ? await col('product_categories').findOne({ id: c.parent_id }, NO_ID) : null;
+  if (opts.publicOnly && (!p.is_active || !c?.is_active)) return null;
 
-  const images = await query(
-    'SELECT id, url, alt_text, sort_order, is_primary FROM product_images WHERE product_id = $1 ORDER BY is_primary DESC, sort_order, id',
-    [p.id],
-  );
-  const variants = await query(
-    `SELECT v.id, v.size, v.color, v.color_hex, v.sku, v.is_active, COALESCE(i.quantity, 0)::int AS quantity, i.updated_at AS stock_updated_at
-     FROM product_variants v LEFT JOIN inventory i ON i.variant_id = v.id
-     WHERE v.product_id = $1 ${opts.publicOnly ? 'AND v.is_active' : ''}
-     ORDER BY v.color, v.id`,
-    [p.id],
-  );
+  const images = (
+    await col('product_images')
+      .find({ product_id: p.id }, { projection: { _id: 0, id: 1, url: 1, alt_text: 1, sort_order: 1, is_primary: 1 } })
+      .toArray()
+  ).sort((a, b) => Number(b.is_primary) - Number(a.is_primary) || a.sort_order - b.sort_order || a.id - b.id);
+
+  const variantFilter = { product_id: p.id, ...(opts.publicOnly ? { is_active: true } : {}) };
+  const rawVariants = await col('product_variants')
+    .find(variantFilter, { projection: { _id: 0, id: 1, size: 1, color: 1, color_hex: 1, sku: 1, is_active: 1 } })
+    .toArray();
+  const stock = await col('inventory')
+    .find({ variant_id: { $in: rawVariants.map((v) => v.id) } })
+    .toArray();
+  const stockById = new Map(stock.map((s) => [s.variant_id, s]));
+  const variants = rawVariants.map((v) => ({
+    ...v,
+    quantity: stockById.get(v.id)?.quantity ?? 0,
+    stock_updated_at: stockById.get(v.id)?.updated_at ?? null,
+  }));
+
   const thr = p.low_stock_threshold ?? threshold;
   variants.sort((a, b) => a.color.localeCompare(b.color) || sizeRank(a.size) - sizeRank(b.size));
   for (const v of variants) v.stock_status = stockStatus(v.quantity, thr);
@@ -213,6 +195,11 @@ export async function getProduct({ id, slug }, opts = {}) {
 
   return {
     ...p,
+    category_name: c?.name ?? null,
+    category_slug: c?.slug ?? null,
+    category_active: c?.is_active ?? false,
+    parent_category_name: pc?.name ?? null,
+    parent_category_slug: pc?.slug ?? null,
     price: p.discount_price ?? p.original_price,
     discount_percent: discountPercent(p.original_price, p.discount_price),
     effective_threshold: thr,
