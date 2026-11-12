@@ -16,7 +16,12 @@ export async function api(path, { method = 'GET', body, form } = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(data.error || `Request failed (${res.status})`);
+    // Always surface readable text, whatever shape the error body has.
+    const raw = typeof data.error === 'string' ? data.error : data.error?.message || data.message;
+    const message =
+      raw ||
+      (res.status >= 500 ? 'The store server is not responding right now. Please try again in a moment.' : `Request failed (${res.status})`);
+    const err = new Error(message);
     err.status = res.status;
     err.fields = data.fields;
     if (res.status === 401 && path.startsWith('/admin')) window.dispatchEvent(new Event('bg:unauthorized'));

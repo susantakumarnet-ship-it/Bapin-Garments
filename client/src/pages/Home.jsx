@@ -7,7 +7,7 @@ import HeroSlider from '../components/store/HeroSlider';
 import { ProductRail, SectionHeading } from '../components/store/Section';
 import { WhatsAppIcon } from '../components/store/WhatsAppButton';
 
-const U = (id, w = 900) => `https://images.unsplash.com/photo-${id}?auto=format&fit=crop&w=${w}&q=80`;
+const IMG = (name) => `/images/home/${name}.jpg`;
 
 const PERKS = [
   { icon: BadgeCheck, title: 'Premium Quality', text: 'Handpicked fabrics & finishes' },
@@ -21,6 +21,13 @@ const TESTIMONIALS = [
   { name: 'Rakesh Pradhan', city: 'Cuttack', text: 'Great collection of formal shirts and trousers at honest prices. Free alteration is a big plus. My go-to store now.', rating: 5 },
   { name: 'Ipsita Nayak', city: 'Puri', text: 'I enquired on WhatsApp about kurtis, got photos and sizes within minutes. Picked them up the same evening. Super convenient!', rating: 5 },
   { name: 'Manoj Sahu', city: 'Bhubaneswar', text: 'Shopping for the entire family under one roof — kids party wear, sarees for my mother, jeans for me. Loved it.', rating: 4 },
+];
+
+const SHOPPERS = [
+  { img: 'shopper-pink', alt: 'Happy shopper with colourful bags', label: 'Shop Women', to: '/shop/women', cover: true },
+  { img: 'shopper-illustration', alt: 'Shopper browsing on her phone', label: 'Enquire on WhatsApp', to: '/contact' },
+  { img: 'shoppers-duo-illustration', alt: 'Two friends out shopping', label: 'New Arrivals', to: '/new-arrivals' },
+  { img: 'shopper-sunglasses', alt: 'Shopper with bags and phone', label: 'Special Offers', to: '/offers' },
 ];
 
 const SHOP_CATS = [
@@ -83,10 +90,10 @@ export default function Home() {
       <section className="container-x pb-6">
         <SectionHeading eyebrow="Curated for you" title="Featured Collections" center />
         <div className="grid gap-4 md:grid-cols-3 md:grid-rows-2 md:[height:560px]">
-          <CollectionTile className="md:row-span-2" to="/shop/wedding-collections" img={U('1617627143750-d86bc21e42bb', 1000)} eyebrow="Shaadi Season" title="Wedding Collection" text="Bridal silks, Anarkalis & sherwanis" />
-          <CollectionTile to="/shop/festival-collections" img={U('1609357605129-26f69add5d6e')} eyebrow="Celebrate in style" title="Festival Collection" />
-          <CollectionTile to="/shop/men-formal-wear" img={U('1594938298603-c8148c4dae35')} eyebrow="Suit up" title="Men's Formal Wear" />
-          <CollectionTile className="md:col-span-2" to="/shop/seasonal-collections" img={U('1558769132-cb1aea458c5e', 1400)} eyebrow="Winter 2026" title="Seasonal Collection" text="Cosy knits, cardigans & sweatshirts" />
+          <CollectionTile className="md:row-span-2" to="/shop/wedding-collections" img={IMG('store-fabrics-mannequin')} eyebrow="Shaadi Season" title="Wedding Collection" text="Bridal silks, Anarkalis & sherwanis" />
+          <CollectionTile to="/shop/festival-collections" img={IMG('fabric-wall')} eyebrow="Celebrate in style" title="Festival Collection" />
+          <CollectionTile to="/shop/men-formal-wear" img={IMG('boxed-shirts')} eyebrow="Suit up" title="Men's Formal Wear" />
+          <CollectionTile className="md:col-span-2" to="/shop/seasonal-collections" img={IMG('shopper-floral')} position="center 25%" eyebrow="Winter 2026" title="Seasonal Collection" text="Cosy knits, cardigans & sweatshirts" />
         </div>
       </section>
 
@@ -109,6 +116,21 @@ export default function Home() {
               Grab the Deals
             </Link>
           </div>
+        </div>
+      </section>
+
+      {/* Happy shoppers */}
+      <section className="container-x py-10">
+        <SectionHeading eyebrow="Shopping made joyful" title="Happy Shoppers" center />
+        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          {SHOPPERS.map((s) => (
+            <Link key={s.img} to={s.to} className="group overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200 transition hover:-translate-y-1 hover:shadow-md">
+              <div className="aspect-square overflow-hidden">
+                <img src={IMG(s.img)} alt={s.alt} loading="lazy" className={`h-full w-full transition-transform duration-500 group-hover:scale-105 ${s.cover ? 'object-cover' : 'object-contain p-2'}`} />
+              </div>
+              <p className="border-t border-slate-100 px-4 py-3 text-center text-sm font-semibold text-navy-800 group-hover:text-maroon-700">{s.label} →</p>
+            </Link>
+          ))}
         </div>
       </section>
 
@@ -176,10 +198,10 @@ export default function Home() {
   );
 }
 
-function CollectionTile({ to, img, eyebrow, title, text, className = '' }) {
+function CollectionTile({ to, img, eyebrow, title, text, position, className = '' }) {
   return (
     <Link to={to} className={`group relative block min-h-[220px] overflow-hidden rounded-xl ${className}`}>
-      <img src={img} alt={title} loading="lazy" className="absolute inset-0 h-full w-full object-cover transition-transform duration-700 group-hover:scale-110" />
+      <img src={img} alt={title} loading="lazy" style={position ? { objectPosition: position } : undefined} className="absolute inset-0 h-full w-full object-cover transition-transform duration-700 group-hover:scale-110" />
       <div className="absolute inset-0 bg-gradient-to-t from-navy-900/85 via-navy-900/20 to-transparent" />
       <div className="absolute inset-x-0 bottom-0 p-6 text-white">
         <p className="text-[11px] font-semibold uppercase tracking-[0.25em] text-gold-300">{eyebrow}</p>

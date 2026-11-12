@@ -84,6 +84,14 @@ export function createApp() {
   if (fs.existsSync(path.join(config.clientDist, 'index.html'))) {
     app.use(express.static(config.clientDist, { maxAge: '1h', index: false }));
     app.get('*', (_req, res) => res.sendFile(path.join(config.clientDist, 'index.html')));
+  } else if (config.isProd) {
+    console.warn(`[app] Website files not found at ${config.clientDist} - only the API is being served.`);
+    app.get('/', (_req, res) =>
+      res
+        .status(503)
+        .type('text')
+        .send('The website has not been built yet. Build it with "npm run build" in client/ (or run "npm install" in server/ with BUILD_CLIENT=true), then restart.'),
+    );
   }
 
   app.use(errorHandler);

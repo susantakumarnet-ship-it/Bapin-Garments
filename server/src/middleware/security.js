@@ -1,18 +1,35 @@
+import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { config } from '../config.js';
 import { HttpError } from '../utils/helpers.js';
+import { AUTH_COOKIE } from './auth.js';
 
-const limiter = (windowMin, max, message) =>
+const limiter = (windowMin, max, message, skip) =>
   rateLimit({
     windowMs: windowMin * 60 * 1000,
     max,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     message: { error: message },
+    ...(skip ? { skip } : {}),
   });
 
-export const apiLimiter = limiter(15, 600, 'Too many requests, please try again later.');
+/** True when the request carries a valid (signed, unexpired) admin session cookie. */
+const hasAdminSession = (req) => {
+  const token = req.cookies?.[AUTH_COOKIE];
+  if (!token) return false;
+  try {
+    jwt.verify(token, config.jwtSecret);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Signed-in staff are not counted: everyone on the shop's Wi-Fi shares one IP,
+// so staff using the admin panel must not lock out customers (or each other).
+export const apiLimiter = limiter(15, 600, 'Too many requests, please try again later.', hasAdminSession);
 export const loginLimiter = limiter(15, 10, 'Too many login attempts. Please wait 15 minutes.');
 export const passwordResetLimiter = limiter(60, 5, 'Too many reset requests. Please try again later.');
 export const enquiryLimiter = limiter(10, 5, 'Too many enquiries submitted. Please try again in a few minutes.');

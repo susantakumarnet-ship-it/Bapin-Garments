@@ -19,7 +19,7 @@ const grid = { stroke: '#eef0f3', vertical: false };
 
 function ChartCard({ title, subtitle, children, action, className = '' }) {
   return (
-    <div className={`card p-5 ${className}`}>
+    <div className={`card min-w-0 p-5 ${className}`}>
       <div className="mb-4 flex items-start justify-between gap-2">
         <div>
           <h3 className="font-semibold text-navy-800">{title}</h3>

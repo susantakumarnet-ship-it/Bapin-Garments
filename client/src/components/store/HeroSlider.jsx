@@ -2,11 +2,11 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 
-const U = (id) => `https://images.unsplash.com/photo-${id}?auto=format&fit=crop&w=1800&q=80`;
+const IMG = (name) => `/images/home/${name}.jpg`;
 
 const SLIDES = [
   {
-    image: U('1617627143750-d86bc21e42bb'),
+    image: IMG('saree-showroom'),
     eyebrow: 'The Wedding Edit 2026',
     title: 'Drape Yourself in Timeless Elegance',
     text: 'Handpicked Kanjeevaram & Banarasi silks, bridal Anarkalis and more.',
@@ -15,7 +15,7 @@ const SLIDES = [
     align: 'left',
   },
   {
-    image: U('1441986300917-64674bd600d8'),
+    image: IMG('shopping-bags-mall'),
     eyebrow: 'Festive Sale is Live',
     title: 'Flat 20–40% Off on Ethnic & Festive Wear',
     text: 'Celebrate every occasion in style without stretching your budget.',
@@ -24,16 +24,16 @@ const SLIDES = [
     align: 'left',
   },
   {
-    image: U('1617137968427-85924c800a22'),
-    eyebrow: "Men's Collection",
-    title: 'Sharp Looks for the Modern Man',
-    text: 'Suits, shirts, denims and jackets tailored for confidence.',
-    cta: 'Shop Men',
-    to: '/shop/men',
+    image: IMG('fabric-shelves'),
+    eyebrow: 'Inside Our Store',
+    title: 'Every Colour, Every Occasion',
+    text: 'Shelves stacked with sarees, dress materials and fabrics in every shade.',
+    cta: 'Browse the Collection',
+    to: '/shop',
     align: 'left',
   },
   {
-    image: U('1490481651871-ab68de25d43d'),
+    image: IMG('shoppers-walking'),
     eyebrow: 'Just Landed',
     title: 'New Arrivals Every Week',
     text: 'Fresh styles for the whole family — from little ones to grandparents.',

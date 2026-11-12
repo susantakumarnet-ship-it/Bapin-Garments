@@ -75,8 +75,14 @@ router.post('/logout', (_req, res) => {
 
 router.get(
   '/me',
-  requireAuth,
-  ah(async (req, res) => res.json({ user: publicUser(req.user) })),
+  // Called on every page load (including by shoppers), so "not logged in" is a
+  // normal answer ({ user: null }), not an error. Admin routes still return 401.
+  (req, res, next) =>
+    requireAuth(req, res, (err) => {
+      if (err?.status === 401) return res.json({ user: null });
+      if (err) return next(err);
+      res.json({ user: publicUser(req.user) });
+    }),
 );
 
 router.post(

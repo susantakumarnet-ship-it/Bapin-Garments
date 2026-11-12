@@ -37,6 +37,7 @@ Notes:
    - **Build command:** `npm run install:all && npm run build`
    - **Start command:** `npm start`
    - **Environment:** every variable from the checklist above
+   - If the service's **Root Directory** is `server` (build command `npm install`, start command `npm start`), that also works: on Render, `npm install` in `server/` builds the website automatically. On other hosts, set `BUILD_CLIENT=true` for the same behaviour.
 4. Deploy. The first boot creates the indexes and the admin account from the `SEED_ADMIN_*` variables, and loads the sample catalogue. To start with an empty catalogue, delete the sample products from the admin panel, or run `npm run seed:reset` locally against the database and then remove the products you don't need.
 5. Point your domain at the service and turn on HTTPS.
 
